@@ -12,6 +12,10 @@ use bincode::config;
 use memmap2::{MmapMut, MmapOptions};
 use ipc_channel::ipc;
 use std::sync::Arc;
+// New imports for fork
+use nix::unistd::{fork, ForkResult};
+use pyo3::ffi;
+use std::process;
 
 // -------- 1) Type descriptors --------
 #[derive(Clone)]
@@ -130,8 +134,8 @@ fn unmarshal_args(
                 let len = map.iter().position(|&b| b == 0).unwrap_or(map.len());
                 let slice = &map[..len];
                 let val: JsonValue = bincode::serde::decode_from_slice(slice, config::legacy())
-    .map_err(|e| PyValueError::new_err(e.to_string()))?
-    .0;
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?
+                    .0;
                 pythonize(py, &val)?.into_py(py)
             }
             _ => return Err(PyValueError::new_err("Unsupported ArgSpec")),
@@ -194,105 +198,102 @@ fn child_loop(
     rx: ipc::IpcReceiver<()>,
     tx: ipc::IpcSender<()>,
 ) {
-    println!("[CHILD] Starting child loop");
-    
-    // Initialize Python BEFORE acquiring the GIL
-    pyo3::prepare_freethreaded_python();
+    println!("[CHILD] Starting child loop with PID: {}", process::id());
     
     match tx.send(()) {
         Ok(_) => println!("[CHILD] Sent initialization signal to parent"),
         Err(e) => println!("[CHILD] Failed to signal parent: {:?}", e),
     }
-    unsafe {
-        pyo3::with_embedded_python_interpreter(|py| {
-            println!("[CHILD] Acquired GIL for child process");
-            
-            // Unpickle the function using cloudpickle
-            println!("[CHILD] Unpickling function with cloudpickle");
-            let func = match || -> PyResult<Bound<'_, PyFunction>> {
-                let cloudpickle = PyModule::import(py, "cloudpickle")?;
-                let unpickled = cloudpickle.getattr("loads")?.call1((PyBytes::new(py, &function_info.pickled_func),))?;
-                let func = unpickled.downcast::<PyFunction>()?;
-                Ok(func.clone())
-            }() {
-                Ok(f) => f,
-                Err(e) => {
-                    println!("[CHILD] Failed to unpickle function: {:?}", e);
-                    return;
-                }
-            };
-            
-            println!("[CHILD] Function unpickled successfully: {}", function_info.function_name);
+    
+    // In forked process, use regular Python::with_gil instead of embedded interpreter
+    Python::with_gil(|py| {
+        println!("[CHILD] Acquired GIL for child process");
+        
+        // Unpickle the function using cloudpickle
+        println!("[CHILD] Unpickling function with cloudpickle");
+        let func = match || -> PyResult<Bound<'_, PyFunction>> {
+            let cloudpickle = PyModule::import(py, "cloudpickle")?;
+            let unpickled = cloudpickle.getattr("loads")?.call1((PyBytes::new(py, &function_info.pickled_func),))?;
+            let func = unpickled.downcast::<PyFunction>()?;
+            Ok(func.clone())
+        }() {
+            Ok(f) => f,
+            Err(e) => {
+                println!("[CHILD] Failed to unpickle function: {:?}", e);
+                return;
+            }
+        };
+        
+        println!("[CHILD] Function unpickled successfully: {}", function_info.function_name);
 
-            loop {
-                // Check for Python interrupts
-                if py.check_signals().is_err() {
-                    println!("[CHILD] Received Python interrupt signal, exiting loop");
-                    // Try to unblock parent if it's waiting
-                    let _ = tx.send(());
-                    break;
-                }
-                
-                println!("[CHILD] Waiting for message from parent");
-                match rx.recv() {
-                    Ok(_) => {
-                        println!("[CHILD] Message received, processing");
-                        
-                        // Unmarshal args with error logging
-                        let args = match unmarshal_args(py, &specs, &in_maps) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                println!("[CHILD] Error unmarshaling args: {:?}", e);
-                                // Notify parent of failure
-                                let _ = tx.send(());
-                                continue;
-                            }
-                        };
-                        
-                        println!("[CHILD] Args unmarshaled, calling function");
-                        
-                        // Call function with error logging
-                        let ret_py = match func.call1((args,)) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                println!("[CHILD] Error calling function: {:?}", e);
-                                // Notify parent of failure
-                                let _ = tx.send(());
-                                continue;
-                            }
-                        };
-                        
-                        println!("[CHILD] Function executed, marshaling return value");
-                        
-                        // Marshal return with error logging
-                        match marshal_ret(&ret_spec, &out_map, &ret_py) {
-                            Ok(_) => println!("[CHILD] Return value marshaled successfully"),
-                            Err(e) => println!("[CHILD] Error marshaling return: {:?}", e),
+        loop {
+            // Check for Python interrupts
+            if py.check_signals().is_err() {
+                println!("[CHILD] Received Python interrupt signal, exiting loop");
+                // Try to unblock parent if it's waiting
+                let _ = tx.send(());
+                break;
+            }
+            
+            println!("[CHILD] Waiting for message from parent");
+            match rx.recv() {
+                Ok(_) => {
+                    println!("[CHILD] Message received, processing");
+                    
+                    // Unmarshal args with error logging
+                    let args = match unmarshal_args(py, &specs, &in_maps) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            println!("[CHILD] Error unmarshaling args: {:?}", e);
+                            // Notify parent of failure
+                            let _ = tx.send(());
+                            continue;
                         }
-                        
-                        println!("[CHILD] Sending completion signal to parent");
-                        
-                        // Send with error handling
-                        match tx.send(()) {
-                            Ok(_) => println!("[CHILD] Signal sent to parent"),
-                            Err(e) => println!("[CHILD] Failed to signal parent: {:?}", e),
+                    };
+                    
+                    println!("[CHILD] Args unmarshaled, calling function");
+                    
+                    // Call function with error logging
+                    let ret_py = match func.call1((args,)) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            println!("[CHILD] Error calling function: {:?}", e);
+                            // Notify parent of failure
+                            let _ = tx.send(());
+                            continue;
                         }
+                    };
+                    
+                    println!("[CHILD] Function executed, marshaling return value");
+                    
+                    // Marshal return with error logging
+                    match marshal_ret(&ret_spec, &out_map, &ret_py) {
+                        Ok(_) => println!("[CHILD] Return value marshaled successfully"),
+                        Err(e) => println!("[CHILD] Error marshaling return: {:?}", e),
                     }
-                    Err(e) => {
-                        println!("[CHILD] Error receiving message: {:?}, exiting loop", e);
-                        break;
+                    
+                    println!("[CHILD] Sending completion signal to parent");
+                    
+                    // Send with error handling
+                    match tx.send(()) {
+                        Ok(_) => println!("[CHILD] Signal sent to parent"),
+                        Err(e) => println!("[CHILD] Failed to signal parent: {:?}", e),
                     }
                 }
-                
-                // Periodically check for interrupts
-                if py.check_signals().is_err() {
-                    println!("[CHILD] Interrupt detected, exiting loop");
+                Err(e) => {
+                    println!("[CHILD] Error receiving message: {:?}, exiting loop", e);
                     break;
                 }
             }
-            println!("[CHILD] Exiting child loop");
-        });
-    };
+            
+            // Periodically check for interrupts
+            if py.check_signals().is_err() {
+                println!("[CHILD] Interrupt detected, exiting loop");
+                break;
+            }
+        }
+        println!("[CHILD] Exiting child loop");
+    });
 }
 
 // -------- 8) Process class with improved logging and error handling --------
@@ -305,6 +306,7 @@ struct Process {
     tx: ipc::IpcSender<()>,
     rx: ipc::IpcReceiver<()>,
     function_info: FunctionInfo,
+    child_pid: Option<nix::unistd::Pid>,  // Track child process PID
 }
 
 #[pymethods]
@@ -365,21 +367,46 @@ impl Process {
         let ret_spec_clone = ret_spec.clone();
         let in_maps_clone = in_maps.clone();
         let out_map_clone = out_map.clone();
-        
-        println!("[PARENT] Spawning child thread");
         let function_info_clone = function_info.clone();
-        std::thread::spawn(move || {
-            child_loop(function_info_clone, specs_clone, ret_spec_clone, in_maps_clone, out_map_clone, rx_c, tx_c)
-        });
-
-        println!("[PARENT] Waiting for child process to initialize");
-        match rx_p.try_recv_timeout(std::time::Duration::from_secs(20)) {
-            Ok(_) => println!("[PARENT] Child process initialized successfully"),
-            Err(e) => return Err(PyValueError::new_err(format!("Child process failed to initialize: {:?}", e))),
+        
+        // REPLACE thread spawn with fork
+        println!("[PARENT] Forking child process");
+        match unsafe { fork() } {
+            Ok(ForkResult::Parent { child }) => {
+                println!("[PARENT] Forked child process with PID: {}", child);
+                
+                // Wait for child initialization
+                println!("[PARENT] Waiting for child process to initialize");
+                match rx_p.try_recv_timeout(std::time::Duration::from_secs(20)) {
+                    Ok(_) => println!("[PARENT] Child process initialized successfully"),
+                    Err(e) => return Err(PyValueError::new_err(format!("Child process failed to initialize: {:?}", e))),
+                }
+                
+                println!("[PARENT] Process setup complete");
+                Ok(Process { 
+                    specs, ret_spec, in_maps, out_map, 
+                    tx: tx_p, rx: rx_p, function_info,
+                    child_pid: Some(child) 
+                })
+            },
+            Ok(ForkResult::Child) => {
+                // In child process
+                println!("[CHILD] Child process forked with PID: {}", process::id());
+                
+                // Fix Python's internal state after fork
+                unsafe { ffi::PyOS_AfterFork_Child() };
+                
+                // Run child loop directly
+                child_loop(
+                    function_info_clone, specs_clone, ret_spec_clone, 
+                    in_maps_clone, out_map_clone, rx_c, tx_c
+                );
+                
+                // Exit the child process
+                process::exit(0);
+            },
+            Err(e) => return Err(PyValueError::new_err(format!("Fork failed: {}", e))),
         }
-
-        println!("[PARENT] Process setup complete");
-        Ok(Process { specs, ret_spec, in_maps, out_map, tx: tx_p, rx: rx_p, function_info })
     }
 
     #[pyo3(signature = (*args,))]
@@ -444,9 +471,26 @@ impl Process {
     }
     
     fn cleanup(&mut self) -> PyResult<()> {
-        println!("[PARENT] Cleanup called, dropping IPC sender");
+        println!("[PARENT] Cleanup called, terminating child process");
         drop(self.tx.clone());
+        
+        // Send signal to terminate child if needed
+        if let Some(pid) = self.child_pid {
+            match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
+                Ok(_) => println!("[PARENT] Sent SIGTERM to child process"),
+                Err(e) => println!("[PARENT] Failed to send SIGTERM: {:?}", e),
+            }
+        }
+        
         Ok(())
+    }
+}
+
+// Add Drop implementation for Process
+impl Drop for Process {
+    fn drop(&mut self) {
+        println!("[PARENT] Process is being dropped, cleaning up");
+        let _ = self.cleanup();
     }
 }
 

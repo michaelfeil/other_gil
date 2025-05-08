@@ -8,9 +8,8 @@ def scale(x: np.ndarray, factor: float) -> np.ndarray:
     return x * factor
 print("Process created")
 # usage:
-arr = np.arange(10, dtype=float)
+arr = np.arange(10)
 print("calling scale")
-import time
-time.sleep(1)
-out = scale(arr, 2.5)
-print("out)ut:", out)
+for i in range(2):
+    out = scale(arr, 3)
+print("output:", out)
