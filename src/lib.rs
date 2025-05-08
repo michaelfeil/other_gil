@@ -11,8 +11,7 @@ use tempfile::tempfile;
 use bincode::config;
 use memmap2::{MmapMut, MmapOptions};
 use ipc_channel::ipc;
-use std::sync::Arc;
-// New imports for fork
+use std::sync::{Arc, Mutex};
 use nix::unistd::{fork, ForkResult};
 use pyo3::ffi;
 use std::process;
@@ -314,14 +313,18 @@ fn child_loop(
 }
 
 // -------- 8) Process class with improved logging and error handling --------
+struct IpcChannelBundle {
+    tx: ipc::IpcSender<()>,
+    rx: ipc::IpcReceiver<()>,
+}
+
 #[pyclass(unsendable)]
 struct Process {
     specs: Vec<ArgSpec>,
     ret_spec: RetSpec,
     in_maps: Vec<Arc<MmapMut>>,
     out_map: Arc<MmapMut>,
-    tx: ipc::IpcSender<()>,
-    rx: ipc::IpcReceiver<()>,
+    channels: Arc<Mutex<IpcChannelBundle>>,
     function_info: FunctionInfo,
     child_pid: Option<nix::unistd::Pid>,  // Track child process PID
 }
@@ -399,10 +402,12 @@ impl Process {
                     Err(e) => return Err(PyValueError::new_err(format!("Child process failed to initialize: {:?}", e))),
                 }
                 
+                let channels = Arc::new(Mutex::new(IpcChannelBundle { tx: tx_p, rx: rx_p }));
                 println!("[PARENT] Process setup complete");
                 Ok(Process { 
                     specs, ret_spec, in_maps, out_map, 
-                    tx: tx_p, rx: rx_p, function_info,
+                    channels, // store it
+                    function_info,
                     child_pid: Some(child) 
                 })
             },
@@ -429,68 +434,60 @@ impl Process {
     #[pyo3(signature = (*args,))]
     fn __call__(&mut self, py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<PyObject> {
         println!("[PARENT] Calling process function");
-        
-        match marshal_args(py, &self.specs, &self.in_maps, &args) {
-            Ok(_) => println!("[PARENT] Arguments marshaled successfully"),
-            Err(e) => return Err(PyValueError::new_err(format!("Failed to marshal arguments: {:?}", e))),
-        }
-        // todo allow threads while waiting for the child to process to avoid blocking
-        
-        println!("[PARENT] Sending message to child process");
-        match self.tx.send(()) {
-            Ok(_) => println!("[PARENT] Message sent successfully"),
-            Err(e) => return Err(PyValueError::new_err(format!("Failed to send to child process: {:?}", e))),
-        }
-        
-        println!("[PARENT] Waiting for response from child");
-        match self.rx.recv() {
-            Ok(_) => println!("[PARENT] Response received from child"),
-            Err(e) => return Err(PyValueError::new_err(format!("Failed to receive from child process: {:?}", e))),
-        }
-        
+
+        marshal_args(py, &self.specs, &self.in_maps, &args)
+            .map_err(|e| PyValueError::new_err(format!("Failed to marshal arguments: {:?}", e)))?;
+
+        py.allow_threads(|| {
+            let lock = self.channels.lock().map_err(|e| e.to_string())?;
+            lock.tx.send(()).map_err(|e| e.to_string())?;
+            lock.rx.recv().map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .map_err(|err_str: String| PyValueError::new_err(err_str))?;
+
         println!("[PARENT] Processing return value");
         let result = match &self.ret_spec {
             RetSpec::NdArray {..} => {
                 println!("[PARENT] Handling ndarray return");
-                let n = self.out_map.len()/std::mem::size_of::<f64>();
+                let n = self.out_map.len() / std::mem::size_of::<f64>();
                 let slice = unsafe { std::slice::from_raw_parts(self.out_map.as_ptr() as *const f64, n) };
                 slice.to_vec().into_pyarray(py).into_py(py)
             }
             RetSpec::Primitive(kind) if kind=="int" => {
                 println!("[PARENT] Handling int return");
-                let mut buf=[0u8;8]; buf.copy_from_slice(&self.out_map[..8]);
-                let v=i64::from_le_bytes(buf);
+                let mut buf=[0u8;8];
+                buf.copy_from_slice(&self.out_map[..8]);
+                let v = i64::from_le_bytes(buf);
                 v.to_object(py)
             }
             RetSpec::Primitive(kind) if kind=="float" => {
                 println!("[PARENT] Handling float return");
-                let mut buf=[0u8;8]; buf.copy_from_slice(&self.out_map[..8]);
-                let v=f64::from_le_bytes(buf);
+                let mut buf=[0u8;8];
+                buf.copy_from_slice(&self.out_map[..8]);
+                let v = f64::from_le_bytes(buf);
                 v.to_object(py)
             }
             RetSpec::Serde => {
                 println!("[PARENT] Handling serde return");
                 let len = self.out_map.iter().position(|&b|b==0).unwrap_or(self.out_map.len());
-                let slice=&self.out_map[..len];
+                let slice = &self.out_map[..len];
                 let val: JsonValue = match bincode::serde::decode_from_slice(slice, config::legacy()) {
                     Ok((v, _)) => v,
                     Err(e) => return Err(PyValueError::new_err(format!("Failed to decode return value: {:?}", e))),
                 };
-                match pythonize(py, &val) {
-                    Ok(obj) => obj.to_object(py),
-                    Err(e) => return Err(PyValueError::new_err(format!("Failed to pythonize return value: {:?}", e))),
-                }
+                pythonize(py, &val)?.to_object(py)
             }
             _ => return Err(PyValueError::new_err("Unsupported RetSpec")),
         };
-        
+
         println!("[PARENT] Call complete, returning result");
         Ok(result)
     }
     
     fn cleanup(&mut self) -> PyResult<()> {
         println!("[PARENT] Cleanup called, terminating child process");
-        drop(self.tx.clone());
+        drop(self.channels.clone());
         
         // Send signal to terminate child if needed
         if let Some(pid) = self.child_pid {
