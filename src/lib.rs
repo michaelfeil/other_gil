@@ -76,9 +76,15 @@ fn marshal_args(
     for ((spec, map), arg) in specs.iter().zip(maps.iter()).zip(args.iter()) {
         match spec {
             ArgSpec::NdArray { .. } => {
-                let arr = arg.downcast::<PyArrayDyn<f64>>()?;
-                let slice = unsafe { arr.as_slice_mut()? };
-                // Safe because MmapMut is designed for this kind of access
+                // First convert to float64 array explicitly
+                let numpy = py.import("numpy")?;
+                let arr_obj = numpy.getattr("asarray")?.call1((arg, "float64"))?;
+                
+                // Now downcast to PyArray
+                let arr = arr_obj.downcast::<PyArrayDyn<f64>>()?;
+                let slice = unsafe { arr.as_slice()? };
+                
+                // Copy to shared memory
                 let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut f64, slice.len()) };
                 dest.copy_from_slice(slice);
             }
@@ -253,8 +259,19 @@ fn child_loop(
                     
                     println!("[CHILD] Args unmarshaled, calling function");
                     
-                    // Call function with error logging
-                    let ret_py = match func.call1((args,)) {
+                    // Create a proper Python tuple from the args vector
+                    let args_tuple = match PyTuple::new(py, &args) {
+                        Ok(tuple) => tuple,
+                        Err(e) => {
+                            println!("[CHILD] Error creating args tuple: {:?}", e);
+                            // Notify parent of failure
+                            let _ = tx.send(());
+                            continue;
+                        }
+                    };
+
+                    // Call the function with the tuple properly unpacked as args
+                    let ret_py = match func.call(args_tuple, None) {
                         Ok(r) => r,
                         Err(e) => {
                             println!("[CHILD] Error calling function: {:?}", e);
@@ -417,6 +434,7 @@ impl Process {
             Ok(_) => println!("[PARENT] Arguments marshaled successfully"),
             Err(e) => return Err(PyValueError::new_err(format!("Failed to marshal arguments: {:?}", e))),
         }
+        // todo allow threads while waiting for the child to process to avoid blocking
         
         println!("[PARENT] Sending message to child process");
         match self.tx.send(()) {
