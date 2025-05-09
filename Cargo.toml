@@ -18,3 +18,5 @@ memmap2 = "*"
 nix = { version =  "0.30.1", features = ["signal"]}
 pyo3-async-runtimes = { version = "0.24", features = ["tokio-runtime"] }
 tokio = "1.40"
+log = "0.4"
+env_logger = "0.10"

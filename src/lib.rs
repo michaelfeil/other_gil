@@ -7,6 +7,7 @@ use pyo3::types::{PyBytes, PyFunction, PyModule, PyTuple};
 use pyo3::Python;
 use std::process;
 use std::sync::{Arc, Mutex};
+use log::{info, warn, error, trace, debug};
 
 #[derive(Clone)]
 struct FunctionInfo {
@@ -32,23 +33,23 @@ fn child_loop(
     rx: ipc::IpcReceiver<Vec<u8>>,
     tx: ipc::IpcSender<Vec<u8>>,
 ) {
-    println!("[CHILD] Starting child loop with PID: {}", process::id());
+    info!("[CHILD] Starting child loop with PID: {}", process::id());
     // Signal parent that we have initialized.
     if let Err(e) = tx.send(vec![]) {
-        println!("[CHILD] Failed to send initialization signal: {:?}", e);
+        error!("[CHILD] Failed to send initialization signal: {:?}", e);
     }
 
     Python::with_gil(|py| {
-        println!("[CHILD] Unpickling function with cloudpickle");
+        info!("[CHILD] Unpickling function with cloudpickle");
         let cloudpickle = match py.import("cloudpickle") {
             Ok(m) => m,
             Err(e) => {
-                println!("[CHILD] Error importing cloudpickle: {:?}", e);
+                error!("[CHILD] Error importing cloudpickle: {:?}", e);
                 return;
             }
         };
         let asyncio = py.import("asyncio").unwrap();
-        let event_loop = asyncio.call_method0("get_event_loop").unwrap();
+        let event_loop = asyncio.call_method0("new_event_loop").unwrap();
         let inspect = py.import("inspect").unwrap();
         let dumps = cloudpickle.getattr("dumps").unwrap();
         let loads = cloudpickle.getattr("loads").unwrap();
@@ -60,7 +61,7 @@ fn child_loop(
         }() {
             Ok(f) => f,
             Err(e) => {
-                println!("[CHILD] Failed to unpickle function: {:?}", e);
+                error!("[CHILD] Failed to unpickle function: {:?}", e);
                 return;
             }
         };
@@ -72,17 +73,17 @@ fn child_loop(
             .unwrap()
             .extract::<bool>()
             .unwrap();
-        println!(
+        info!(
             "[CHILD] Function unpickled successfully: {}",
             function_info.function_name
         );
 
         loop {
-            println!("[CHILD] Waiting for pickled arguments from parent...");
+            debug!("[CHILD] Waiting for pickled arguments from parent...");
             let pickled_args = match rx.recv() {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    println!("[CHILD] Error receiving arguments: {:?}, exiting", e);
+                    error!("[CHILD] Error receiving arguments: {:?}, exiting", e);
                     break;
                 }
             };
@@ -90,29 +91,29 @@ fn child_loop(
             let args_obj = match loads.call1((PyBytes::new(py, &pickled_args),)) {
                 Ok(o) => o,
                 Err(e) => {
-                    println!("[CHILD] Error unpickling args: {:?}", e);
+                    error!("[CHILD] Error unpickling args: {:?}", e);
                     continue;
                 }
             };
             let args_tuple = match args_obj.downcast::<PyTuple>() {
                 Ok(t) => t,
                 Err(e) => {
-                    println!("[CHILD] Expected tuple of arguments, got error: {:?}", e);
+                    error!("[CHILD] Expected tuple of arguments, got error: {:?}", e);
                     continue;
                 }
             };
-            println!("[CHILD] Calling function with unpickled arguments");
+            trace!("[CHILD] Calling function with unpickled arguments");
             let call_result_obj = match func.call(args_tuple, None) {
                 Ok(r) => r,
                 Err(e) => {
-                    println!("[CHILD] Error calling function: {:?}", e);
+                    error!("[CHILD] Error calling function: {:?}", e);
                     continue;
                 }
             };
 
             // Check if the result is awaitable (a coroutine) and run it
             let final_ret_obj = if is_coroutine {
-                println!("[CHILD] Function is a coroutine, awaiting result");
+                debug!("[CHILD] Function is a coroutine, awaiting result");
                 let await_result = event_loop
                     .call_method1("run_until_complete", (call_result_obj,))
                     .unwrap();
@@ -125,22 +126,22 @@ fn child_loop(
                 Ok(py_bytes) => match py_bytes.extract() {
                     Ok(b) => b,
                     Err(e) => {
-                        println!("[CHILD] Error extracting pickled return: {:?}", e);
+                        error!("[CHILD] Error extracting pickled return: {:?}", e);
                         // TODO: Consider sending a pickled error back to the parent
                         continue;
                     }
                 },
                 Err(e) => {
-                    println!("[CHILD] Error pickling return value: {:?}", e);
+                    error!("[CHILD] Error pickling return value: {:?}", e);
                     // TODO: Consider sending a pickled error back to the parent
                     continue;
                 }
             };
             if let Err(e) = tx.send(pickled_ret) {
-                println!("[CHILD] Failed to send return value: {:?}", e);
+                error!("[CHILD] Failed to send return value: {:?}", e);
             }
         } // loop
-        println!("[CHILD] Exiting child loop");
+        info!("[CHILD] Exiting child loop");
     });
 }
 
@@ -149,11 +150,11 @@ impl Process {
     #[staticmethod]
     #[pyo3(signature=(func))]
     fn from_signature(py: Python<'_>, func: PyObject) -> PyResult<Self> {
-        println!("[PARENT] Creating Process from signature");
+        info!("[PARENT] Creating Process from signature");
         let func_ref = func.bind(py).downcast::<PyFunction>()?;
         let module_name = func_ref.getattr("__module__")?.extract::<String>()?;
         let function_name = func_ref.getattr("__name__")?.extract::<String>()?;
-        println!(
+        info!(
             "[PARENT] Function identified: {}.{}",
             module_name, function_name
         );
@@ -169,21 +170,22 @@ impl Process {
             pickled_func,
         };
 
-        println!("[PARENT] Setting up IPC channels");
+        debug!("[PARENT] Setting up IPC channels");
         let (tx_p, rx_c): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
             ipc::channel().unwrap();
         let (tx_c, rx_p): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
             ipc::channel().unwrap();
 
         // Fork the child process.
-        println!("[PARENT] Forking child process");
+        info!("[PARENT] Forking child process");
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child }) => {
-                println!("[PARENT] Forked child process with PID: {}", child);
+                info!("[PARENT] Forked child process with PID: {}", child);
                 // Wait for the child's initialization signal.
                 match rx_p.recv() {
-                    Ok(_) => println!("[PARENT] Child process initialized successfully"),
+                    Ok(_) => info!("[PARENT] Child process initialized successfully"),
                     Err(e) => {
+                        error!("[PARENT] Child process failed to initialize: {:?}", e);
                         return Err(PyValueError::new_err(format!(
                             "Child process failed to initialize: {:?}",
                             e
@@ -191,7 +193,7 @@ impl Process {
                     }
                 }
                 let channels = Arc::new(Mutex::new(IpcChannelBundle { tx: tx_p, rx: rx_p }));
-                println!("[PARENT] Process setup complete");
+                info!("[PARENT] Process setup complete");
                 Ok(Process {
                     channels,
                     function_info,
@@ -199,12 +201,20 @@ impl Process {
                 })
             }
             Ok(ForkResult::Child) => {
-                println!("[CHILD] Child process forked with PID: {}", process::id());
+                info!("[CHILD] Child process forked with PID: {}", process::id());
+                // It's good practice to re-initialize the logger in the child process
+                // if the parent had initialized it, especially if it involves file handles
+                // or other resources that might not be correctly inherited or shared after fork.
+                // However, env_logger typically writes to stderr, which should be fine.
+                // For more complex logging setups, consider explicit re-initialization.
                 unsafe { ffi::PyOS_AfterFork_Child() };
                 child_loop(function_info, rx_c, tx_c);
                 process::exit(0);
             }
-            Err(e) => return Err(PyValueError::new_err(format!("Fork failed: {}", e))),
+            Err(e) => {
+                error!("[PARENT] Fork failed: {}", e);
+                return Err(PyValueError::new_err(format!("Fork failed: {}", e)))
+            },
         }
     }
 
@@ -214,7 +224,7 @@ impl Process {
         py: Python<'p>,
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        println!("[PARENT] Calling process function");
+        info!("[PARENT] Calling process function");
         // Pickle the arguments using cloudpickle.
         let pickled_args: Vec<u8> = Python::with_gil(|py| {
             let cloudpickle = py.import("cloudpickle")?;
@@ -224,15 +234,26 @@ impl Process {
         })?;
         let pickled_ret: Vec<u8> = py
             .allow_threads(|| {
-                let lock = self.channels.lock().map_err(|e| e.to_string())?;
-                lock.tx.send(pickled_args).map_err(|e| e.to_string())?;
+                let lock = self.channels.lock().map_err(|e| {
+                    error!("[PARENT] Failed to acquire channel lock: {}", e);
+                    e.to_string()
+                })?;
+                trace!("[PARENT] Sending pickled arguments to child");
+                lock.tx.send(pickled_args).map_err(|e| {
+                    error!("[PARENT] Failed to send arguments to child: {}", e);
+                    e.to_string()
+                })?;
                 // Wait for the child to send back the pickled return value.
-                lock.rx.recv().map_err(|e| e.to_string())
+                debug!("[PARENT] Waiting for pickled return value from child");
+                lock.rx.recv().map_err(|e| {
+                    error!("[PARENT] Failed to receive return value from child: {}", e);
+                    e.to_string()
+                })
             })
             .map_err(|err_str: String| PyValueError::new_err(err_str))?;
 
         // Unpickle the return value.
-        println!("[PARENT] Call complete, returning result");
+        info!("[PARENT] Call complete, returning result");
 
         // Store the pickled data in a variable that can be moved into the async block
         let pickled_data = pickled_ret.clone();
@@ -250,14 +271,14 @@ impl Process {
     }
 
     fn cleanup(&mut self) -> PyResult<()> {
-        println!("[PARENT] Cleanup called, terminating child process");
+        info!("[PARENT] Cleanup called, terminating child process");
         drop(self.channels.clone());
 
         // Send signal to terminate child if needed
         if let Some(pid) = self.child_pid {
             match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-                Ok(_) => println!("[PARENT] Sent SIGTERM to child process"),
-                Err(e) => println!("[PARENT] Failed to send SIGTERM: {:?}", e),
+                Ok(_) => info!("[PARENT] Sent SIGTERM to child process {}", pid),
+                Err(e) => warn!("[PARENT] Failed to send SIGTERM to child {}: {:?}", pid, e),
             }
         }
         Ok(())
@@ -267,14 +288,19 @@ impl Process {
 // Add Drop implementation for Process
 impl Drop for Process {
     fn drop(&mut self) {
-        println!("[PARENT] Process is being dropped, cleaning up");
+        info!("[PARENT] Process is being dropped, cleaning up");
         let _ = self.cleanup();
     }
 }
 
 #[pymodule]
 fn other_gil(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    println!("[MODULE] Initializing other_gil module");
+    // Initialize the logger. You can customize this further if needed.
+    // For example, to set a default log level if RUST_LOG is not set:
+    // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Or simply:
+    let _ = env_logger::try_init(); // Use try_init to avoid panic if already initialized
+    info!("[MODULE] Initializing other_gil module");
     m.add_class::<Process>()?;
     Ok(())
 }
