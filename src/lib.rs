@@ -1,19 +1,17 @@
-use ipc_channel::ipc;
-use nix::unistd::{/*fork, ForkResult*/}; // ForkResult no longer needed, fork will be removed
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender, IpcOneShotServer};
+use nix::unistd::Pid;
 use pyo3::exceptions::PyValueError;
-use pyo3::ffi;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyFunction, PyModule, PyTuple};
+use pyo3::types::{PyBytes, PyFunction, PyTuple};
 use pyo3::Python;
-use std::process::{self, Command, Stdio}; // Added Command, Stdio
-use std::env; // Added env
+use std::process::{self, Command, Stdio};
+use std::env;
 use std::sync::{Arc, Mutex};
 use log::{info, warn, error, trace, debug};
-use serde::{Serialize, Deserialize}; 
-use std::os::unix::io::AsRawFd;
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use serde::{Serialize, Deserialize};
+use uuid::Uuid;
 
-#[derive(Clone, Serialize, Deserialize)] 
+#[derive(Clone, Serialize, Deserialize)]
 struct FunctionInfo {
     function_name: String,
     pickled_func: Vec<u8>,
@@ -28,28 +26,39 @@ struct ParentEndChannels {
 // Information about a single replica process
 struct ReplicaProcessInfo {
     ipc_channels: ParentEndChannels,
-    child_pid: nix::unistd::Pid, // Stays as nix::unistd::Pid, will convert from u32
+    child_pid: Pid,
 }
 
 #[pyclass()]
 struct AsyncPool {
     child_processes: Vec<Arc<Mutex<ReplicaProcessInfo>>>,
-    next_replica_idx: Arc<Mutex<usize>>, 
+    next_replica_idx: Arc<Mutex<usize>>,
 }
 
-fn make_inheritable_receiver<T>(_: &ipc::IpcReceiver<T>) -> Result<(), nix::Error> {
-    Ok(())
+// Helper for parent to create setup servers for one child
+struct IpcSetupEndpoints {
+    p2c_rendezvous_server: IpcOneShotServer<IpcSender<Vec<u8>>>,
+    p2c_rendezvous_server_name: String,
+    c2p_data_server: IpcOneShotServer<Vec<u8>>,
+    c2p_data_server_name: String,
 }
 
-fn make_inheritable_sender<T>(_: &ipc::IpcSender<T>) -> Result<(), nix::Error> {
-    Ok(())
+fn create_ipc_setup_endpoints() -> PyResult<IpcSetupEndpoints> {
+    let (p2c_server, p2c_name) = IpcOneShotServer::<IpcSender<Vec<u8>>>::new()
+        .map_err(|e| PyValueError::new_err(format!("Parent: Failed to create P->C rendezvous server: {}", e)))?;
+    let (c2p_server, c2p_name) = IpcOneShotServer::<Vec<u8>>::new()
+        .map_err(|e| PyValueError::new_err(format!("Parent: Failed to create C->P data server: {}", e)))?;
+    Ok(IpcSetupEndpoints {
+        p2c_rendezvous_server: p2c_server,
+        p2c_rendezvous_server_name: p2c_name,
+        c2p_data_server: c2p_server,
+        c2p_data_server_name: c2p_name,
+    })
 }
 
-// This child_loop is from the previous step, expecting FunctionInfo via IPC.
-// It's called by child_entry_point in the spawned process.
 fn child_loop(
-    rx_from_parent: ipc::IpcReceiver<Vec<u8>>, 
-    tx_to_parent: ipc::IpcSender<Vec<u8>>,   
+    rx_from_parent: ipc::IpcReceiver<Vec<u8>>,
+    tx_to_parent: ipc::IpcSender<Vec<u8>>,
 ) {
     let child_pid = process::id();
     info!("[CHILD PID {}] Starting child loop", child_pid);
@@ -59,7 +68,11 @@ fn child_loop(
             Ok(fi) => fi,
             Err(e) => {
                 error!("[CHILD PID {}] Failed to deserialize FunctionInfo: {:?}. Exiting.", child_pid, e);
-                let _ = tx_to_parent.send(bincode::serialize(&Result::<(), String>::Err(format!("Deserialize FunctionInfo error: {}", e))).unwrap_or_default());
+                let err_msg = format!("Child: Deserialize FunctionInfo error: {}", e);
+                let serialized_err = bincode::serialize(&Result::<(), String>::Err(err_msg)).unwrap_or_default();
+                if tx_to_parent.send(serialized_err).is_err() {
+                    error!("[CHILD PID {}] Also failed to send deserialization error to parent.", child_pid);
+                }
                 process::exit(1);
             }
         },
@@ -70,7 +83,7 @@ fn child_loop(
     };
     info!("[CHILD PID {}] Received and deserialized FunctionInfo for: {}", child_pid, function_info.function_name);
 
-    if let Err(e) = tx_to_parent.send(vec![]) { 
+    if let Err(e) = tx_to_parent.send(vec![]) {
         error!("[CHILD PID {}] Failed to send initialization signal: {:?}", child_pid, e);
         process::exit(1);
     }
@@ -177,50 +190,45 @@ fn child_loop(
     process::exit(0); // Ensure child process exits after loop
 }
 
-// New function to be called by child process logic from #[pymodule]
 fn child_process_entry_point(
-    rx_from_parent_b64: String, 
-    tx_to_parent_b64: String
+    p2c_rendezvous_server_name: String,
+    c2p_data_server_name: String
 ) -> PyResult<()> {
-    let rx_bytes = base64::decode(&rx_from_parent_b64)
-        .map_err(|e| PyValueError::new_err(format!("Child: Failed to decode rx_channel: {}", e)))?;
-    let tx_bytes = base64::decode(&tx_to_parent_b64)
-        .map_err(|e| PyValueError::new_err(format!("Child: Failed to decode tx_channel: {}", e)))?;
+    info!("[CHILD_SPAWN_ENTRY PID {}] Connecting to parent IPC servers", std::process::id());
 
-    let rx_from_parent: ipc::IpcReceiver<Vec<u8>> = bincode::deserialize(&rx_bytes)
-        .map_err(|e| PyValueError::new_err(format!("Child: Failed to deserialize rx_channel: {}", e)))?;
-    let tx_to_parent: ipc::IpcSender<Vec<u8>> = bincode::deserialize(&tx_bytes)
-        .map_err(|e| PyValueError::new_err(format!("Child: Failed to deserialize tx_channel: {}", e)))?;
-    
-    pyo3::prepare_freethreaded_python(); 
-    
-    info!("[CHILD_SPAWN_ENTRY] Process detected as child worker. PID: {}. Calling child_loop.", std::process::id());
-    
+    let (sender_for_parent_to_use, rx_from_parent) = ipc::channel::<Vec<u8>>()
+        .map_err(|e| PyValueError::new_err(format!("Child: Failed to create P->C channel: {}", e)))?;
+
+    let conn_to_p2c_rendezvous = IpcSender::connect(p2c_rendezvous_server_name.clone())
+        .map_err(|e| PyValueError::new_err(format!("Child: Failed to connect to P->C rendezvous server ({}): {}", p2c_rendezvous_server_name, e)))?;
+
+    conn_to_p2c_rendezvous.send(sender_for_parent_to_use)
+        .map_err(|e| PyValueError::new_err(format!("Child: Failed to send P->C sender to parent: {}", e)))?;
+    info!("[CHILD_SPAWN_ENTRY PID {}] P->C channel setup complete. rx_from_parent is ready.", std::process::id());
+
+    let tx_to_parent = IpcSender::<Vec<u8>>::connect(c2p_data_server_name.clone())
+        .map_err(|e| PyValueError::new_err(format!("Child: Failed to connect C->P sender to data server ({}): {}", c2p_data_server_name, e)))?;
+    info!("[CHILD_SPAWN_ENTRY PID {}] C->P channel setup complete. tx_to_parent is ready.", std::process::id());
+
+    pyo3::prepare_freethreaded_python();
+
+    info!("[CHILD_SPAWN_ENTRY PID {}] IPC fully established. Calling child_loop.", std::process::id());
+
     child_loop(rx_from_parent, tx_to_parent);
-    
-    Ok(()) 
+
+    Ok(())
 }
 
 #[pyfunction]
-pub fn child() -> PyResult<()> {
-    // Initialize logging in child process context
-    // let _ = env_logger::Builder::from_env(
-    //     env_logger::Env::default().default_filter_or("info")
-    // ).try_init();
-    info!("[GILBOOST_CHILD] Initializing child process logging.");
+pub fn child(p2c_rendezvous_server_name: String, c2p_data_server_name: String) -> PyResult<()> {
+    let child_pid = std::process::id();
+    println!("[GILBOOST_CHILD PID {}] Starting child process", child_pid);
 
-    // Retrieve IPC channel information from environment
-    let rx_b64 = std::env::var("GILBOOST_RX_CHANNEL_B64")
-        .map_err(|e| PyValueError::new_err(format!("Child: Missing GILBOOST_RX_CHANNEL_B64: {}", e)))?;
-    let tx_b64 = std::env::var("GILBOOST_TX_CHANNEL_B64")
-        .map_err(|e| PyValueError::new_err(format!("Child: Missing GILBOOST_TX_CHANNEL_B64: {}", e)))?;
+    info!("[GILBOOST_CHILD] Detected child process environment variables.");
+    info!("[GILBOOST_CHILD] P2C Rendezvous Server: {}", p2c_rendezvous_server_name);
+    info!("[GILBOOST_CHILD] C2P Data Server: {}", c2p_data_server_name);
 
-    info!("[GILBOOST_CHILD] Detected child process environment variables. PID: {}", std::process::id());
-    info!("[GILBOOST_CHILD] RX channel: {}", rx_b64);
-    info!("[GILBOOST_CHILD] TX channel: {}", tx_b64);
-
-    // Launch the child process loop
-    child_process_entry_point(rx_b64, tx_b64)
+    child_process_entry_point(p2c_rendezvous_server_name, c2p_data_server_name)
 }
 
 #[pymethods]
@@ -232,118 +240,103 @@ impl AsyncPool {
             return Err(PyValueError::new_err("Number of replicas must be at least 1"));
         }
         let parent_pid = process::id();
-        info!("[PARENT PID {}] Creating AsyncPool with {} replicas using spawn.", parent_pid, replicas);
+        info!("[PARENT PID {}] Creating AsyncPool with {} replicas.", parent_pid, replicas);
 
         let func_ref = func.bind(py).downcast::<PyFunction>()?;
         let function_name = func_ref.getattr("__name__")?.extract::<String>()?;
         let cloudpickle = py.import("cloudpickle")?;
-        let pickled_func: Vec<u8> = cloudpickle
+        let pickled_func_bytes: Vec<u8> = cloudpickle
             .getattr("dumps")?
             .call1((func.clone_ref(py),))?
             .extract()?;
+
         let function_info = FunctionInfo {
             function_name,
-            pickled_func,
+            pickled_func: pickled_func_bytes,
         };
 
-        let mut all_replica_infos = Vec::with_capacity(replicas);
-        let current_python_exe = env::current_exe()
-            .map_err(|e| PyValueError::new_err(format!("Failed to get current executable (python) path: {}", e)))?;
-        
-        info!("current python_exe: {:?}", current_python_exe);
+        let mut child_processes_info = Vec::with_capacity(replicas);
+
+        let current_exe = env::current_exe()
+            .map_err(|e| PyValueError::new_err(format!("Failed to get current executable path: {}", e)))?;
+
+        info!("[PARENT PID {}] Current executable for spawning children: {:?}", parent_pid, current_exe);
 
         for i in 0..replicas {
-            debug!("[PARENT PID {}] Setting up IPC channels for replica {}", parent_pid, i + 1);
-            let (tx_to_child_p, rx_for_child_c): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
-                ipc::channel().map_err(|e| PyValueError::new_err(format!("Failed to create to-child IPC channel: {}", e)))?;
-            let (tx_from_child_c, rx_from_child_p): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
-                ipc::channel().map_err(|e| PyValueError::new_err(format!("Failed to create from-child IPC channel: {}", e)))?;
-            
-            // Make the channels that are passed to the child inheritable.
-            make_inheritable_receiver(&rx_for_child_c).map_err(|e| PyValueError::new_err(format!("Failed to set inheritable: {}", e)))?;
-            make_inheritable_sender(&tx_from_child_c).map_err(|e| PyValueError::new_err(format!("Failed to set inheritable: {}", e)))?;
+            let replica_id = i + 1;
+            debug!("[PARENT PID {}] Setting up IPC for replica {}", parent_pid, replica_id);
 
-            let function_info_clone_for_child = function_info.clone();
+            let setup_endpoints = create_ipc_setup_endpoints()?;
 
-            let rx_for_child_serialized = bincode::serialize(&rx_for_child_c)
-                .map_err(|e| PyValueError::new_err(format!("Failed to serialize rx_for_child_c: {}", e)))?;
-            let tx_from_child_serialized = bincode::serialize(&tx_from_child_c)
-                .map_err(|e| PyValueError::new_err(format!("Failed to serialize tx_from_child_c: {}", e)))?;
+            let function_info_clone = function_info.clone();
 
-            let rx_b64 = base64::encode(&rx_for_child_serialized);
-            let tx_b64 = base64::encode(&tx_from_child_serialized);
-
-            info!("[PARENT PID {}] Spawning child process {}/{}", parent_pid, i + 1, replicas);
-            
-            let mut cmd = Command::new(&current_python_exe);
-            // cmd.arg("-c")
-            //    .arg(format!("import {}; import sys; sys.exit(0)", this_module_name)) 
-            //    .env("GILBOOST_CHILD_PROCESS", "1")
-            //    .env("GILBOOST_RX_CHANNEL_B64", rx_b64)
-            //    .env("GILBOOST_TX_CHANNEL_B64", tx_b64)
-            //    .stdin(Stdio::null()); 
+            info!("[PARENT PID {}] Spawning childs process {}/{}", parent_pid, replica_id, replicas);
+            let mut cmd = Command::new(&current_exe);
             cmd.arg("-c")
-                .arg(format!("print('call gilboost');import gilboost; print('call child'); gilboost.child(); print('exit child'); import sys; sys.exit(0)"))
-                .env("GILBOOST_CHILD_PROCESS", "1")
-                .env("GILBOOST_RX_CHANNEL_B64", rx_b64)
-                .env("GILBOOST_TX_CHANNEL_B64", tx_b64)
-                .stdin(Stdio::null()); 
-                
+                .arg(format!(r#"
+import os, sys, traceback
+try:
+    import gilboost 
+    print("[GILBOOST_CHILD] Importing gilboost in child process", os.getpid())
+    gilboost.child("{}", "{}")
+except Exception as e:
+    traceback.print_exc(file=sys.stderr)
+    sys.exit(1)
+"#, setup_endpoints.p2c_rendezvous_server_name, setup_endpoints.c2p_data_server_name))               
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
 
             if let Ok(rust_log_val) = env::var("RUST_LOG") {
                 cmd.env("RUST_LOG", rust_log_val);
             }
+            if let Ok(python_path_val) = env::var("PYTHONPATH") {
+                cmd.env("PYTHONPATH", python_path_val);
+            }
 
-            let mut child_process = cmd.spawn().map_err(|e| {
-                PyValueError::new_err(format!("Failed to spawn child process {}/{}: {}", i + 1, replicas, e))
+            let child_handle = cmd.spawn().map_err(|e| {
+                PyValueError::new_err(format!("Parent: Failed to spawn child process {}/{}: {}", replica_id, replicas, e))
             })?;
-            
-            let child_id_u32 = child_process.id();
-            info!("[PARENT PID {}] Spawned child process {}/{} with OS PID: {}", parent_pid, i + 1, replicas, child_id_u32);
 
-            let serialized_function_info = bincode::serialize(&function_info_clone_for_child)
-                .map_err(|e| PyValueError::new_err(format!("Failed to serialize FunctionInfo for child {}: {}", i + 1, e)))?;
-            
-            if let Err(e) = tx_to_child_p.send(serialized_function_info) {
-                error!("[PARENT PID {}] Failed to send FunctionInfo to child {} (OS PID {}): {:?}", parent_pid, i + 1, child_id_u32, e);
-                child_process.kill().ok();
-                child_process.wait().ok();
-                return Err(PyValueError::new_err(format!("Failed to send FunctionInfo to child {}: {:?}", i + 1, e)));
-            }
-            info!("[PARENT PID {}] Sent FunctionInfo to child {} (OS PID {})", parent_pid, i + 1, child_id_u32);
+            let child_actual_pid = child_handle.id();
+            info!("[PARENT PID {}] Spawned child {} (OS PID {}) with P2C Server: {}, C2P Server: {}",
+                parent_pid, replica_id, child_actual_pid,
+                setup_endpoints.p2c_rendezvous_server_name,
+                setup_endpoints.c2p_data_server_name);
 
-            match rx_from_child_p.recv() {
-                Ok(payload) if payload.is_empty() => {
-                    info!("[PARENT PID {}] Child process {} (OS PID {}) initialized successfully", parent_pid, i + 1, child_id_u32);
-                }
-                Ok(_non_empty_payload) => {
-                    error!("[PARENT PID {}] Child process {} (OS PID {}) sent unexpected init signal.", parent_pid, i + 1, child_id_u32);
-                    child_process.kill().ok();
-                    child_process.wait().ok();
-                    return Err(PyValueError::new_err(format!(
-                        "Child process {} (OS PID {}) sent unexpected init signal", i + 1, child_id_u32
-                    )));
-                }
-                Err(e) => {
-                    error!("[PARENT PID {}] Child process {} (OS PID {}) failed to initialize or send signal: {:?}", parent_pid, i + 1, child_id_u32, e);
-                    return Err(PyValueError::new_err(format!(
-                        "Child process {} (OS PID {}) failed to initialize: {:?}",
-                        i + 1, child_id_u32, e
-                    )));
-                }
+            let (_rx_on_p2c_rendezvous, tx_to_child) = setup_endpoints.p2c_rendezvous_server.accept()
+                .map_err(|e| PyValueError::new_err(format!("Parent: Failed to accept on P->C rendezvous for child {}: {:?}", replica_id, e)))?;
+            info!("[PARENT PID {}] Accepted P->C rendezvous from child {}", parent_pid, replica_id);
+
+            let (rx_from_child, initial_signal_from_child) = setup_endpoints.c2p_data_server.accept()
+                .map_err(|e| PyValueError::new_err(format!("Parent: Failed to accept on C->P data server for child {}: {:?}", replica_id, e)))?;
+            info!("[PARENT PID {}] Accepted C->P data connection from child {}", parent_pid, replica_id);
+
+            if initial_signal_from_child.is_empty() {
+                info!("[PARENT PID {}] Received correct initialization signal from child {}", parent_pid, replica_id);
+            } else {
+                error!("[PARENT PID {}] Received unexpected initialization signal from child {}: {:?}", parent_pid, replica_id, initial_signal_from_child);
+                return Err(PyValueError::new_err(format!("Parent: Bad init signal from child {}", replica_id)));
             }
-            
-            let parent_channels = ParentEndChannels { tx_to_child: tx_to_child_p, rx_from_child: rx_from_child_p };
-            let replica_info = ReplicaProcessInfo { 
-                ipc_channels: parent_channels, 
-                child_pid: nix::unistd::Pid::from_raw(child_id_u32 as i32), 
-            };
-            all_replica_infos.push(Arc::new(Mutex::new(replica_info)));
+
+            let serialized_function_info = bincode::serialize(&function_info_clone)
+                .map_err(|e| PyValueError::new_err(format!("Parent: Failed to serialize FunctionInfo: {}", e)))?;
+
+            tx_to_child.send(serialized_function_info)
+                .map_err(|e| PyValueError::new_err(format!("Parent: Failed to send FunctionInfo to child {}: {:?}", replica_id, e)))?;
+            info!("[PARENT PID {}] Sent FunctionInfo to child {}", parent_pid, replica_id);
+
+            child_processes_info.push(Arc::new(Mutex::new(ReplicaProcessInfo {
+                ipc_channels: ParentEndChannels {
+                    tx_to_child,
+                    rx_from_child,
+                },
+                child_pid: Pid::from_raw(child_actual_pid as i32),
+            })));
         }
 
-        info!("[PARENT PID {}] All {} replica processes setup complete", parent_pid, replicas);
+        info!("[PARENT PID {}] All {} child processes initialized.", parent_pid, replicas);
         Ok(AsyncPool {
-            child_processes: all_replica_infos,
+            child_processes: child_processes_info,
             next_replica_idx: Arc::new(Mutex::new(0)),
         })
     }
@@ -354,21 +347,14 @@ impl AsyncPool {
         py: Python<'p>,
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        if self.child_processes.is_empty() {
-            error!("[PARENT] __call__ invoked on a AsyncPool with no replicas.");
-            return Err(PyValueError::new_err("No replicas available to handle the call."));
-        }
-        
-        let replica_arc = {
-            let mut idx_guard = self.next_replica_idx.lock().unwrap_or_else(|e| {
-                error!("[PARENT] Failed to lock next_replica_idx: {}", e);
-                panic!("Failed to lock next_replica_idx: {}", e);
-            });
-            let current_idx = *idx_guard;
-            *idx_guard = (current_idx + 1) % self.child_processes.len();
-            debug!("[PARENT] Selected replica {} for call", current_idx);
-            self.child_processes[current_idx].clone()
-        };
+        let mut idx_guard = self.next_replica_idx.lock().unwrap();
+        let current_idx = *idx_guard;
+        *idx_guard = (current_idx + 1) % self.child_processes.len();
+        drop(idx_guard);
+
+        let replica_info_arc = self.child_processes[current_idx].clone();
+
+        info!("[PARENT] Dispatching call to replica index: {}", current_idx);
 
         let pickled_args: Vec<u8> = {
             let cloudpickle = py.import("cloudpickle")?;
@@ -376,28 +362,19 @@ impl AsyncPool {
             let py_bytes = dumps.call1((args,))?;
             py_bytes.extract()?
         };
-
+        
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let ipc_task_result = tokio::task::spawn_blocking(move || {
-                let guard = replica_arc.lock().map_err(|e| {
-                    let msg = format!("Failed to acquire replica channel lock: {}", e);
-                    error!("[PARENT] {}", msg);
-                    msg 
-                })?;
+                let replica_info_guard = replica_info_arc.lock().unwrap();
                 
-                trace!("[PARENT] Sending pickled arguments to child PID {}", guard.child_pid);
-                guard.ipc_channels.tx_to_child.send(pickled_args).map_err(|e| {
-                    let msg = format!("Failed to send arguments to child {}: {}", guard.child_pid, e);
-                    error!("[PARENT] {}", msg);
-                    msg
-                })?;
-                
-                debug!("[PARENT] Waiting for pickled return value from child PID {}", guard.child_pid);
-                guard.ipc_channels.rx_from_child.recv().map_err(|e| {
-                    let msg = format!("Failed to receive data from child {}: {}", guard.child_pid, e);
-                    error!("[PARENT] {}", msg);
-                    msg
-                })
+                info!("[PARENT] Worker {}: Acquired lock, dispatching to child PID: {}", current_idx, replica_info_guard.child_pid);
+
+                replica_info_guard.ipc_channels.tx_to_child.send(pickled_args)
+                    .map_err(|e| PyValueError::new_err(format!("Failed to send args to child: {:?}", e)))?;
+
+                let pickled_result_bytes = replica_info_guard.ipc_channels.rx_from_child.recv()
+                    .map_err(|e| PyValueError::new_err(format!("Failed to receive result from child: {:?}", e)))?;
+                Ok(pickled_result_bytes)
             }).await;
 
             match ipc_task_result {
@@ -411,8 +388,8 @@ impl AsyncPool {
                         Ok(bound_obj.to_object(py_inner)) 
                     })
                 }
-                Ok(Err(ipc_err_str)) => { 
-                    Err(PyValueError::new_err(ipc_err_str))
+                Ok(Err(ipc_py_err)) => { // ipc_py_err is already a PyErr
+                    Err(ipc_py_err) // Propagate the existing PyErr
                 }
                 Err(join_err) => { 
                     let err_msg = format!("IPC task panicked or was cancelled: {}", join_err);
@@ -422,7 +399,6 @@ impl AsyncPool {
             }
         })
     }
-
     fn cleanup(&mut self) -> PyResult<()> {
         info!("[PARENT] Cleanup called, terminating {} child process(es)", self.child_processes.len());
         
