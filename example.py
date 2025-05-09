@@ -3,13 +3,15 @@ from other_gil import Process
 
 print("Creating process")
 @Process.from_signature
-def scale(x: float, factor: float) -> float:
-    print(f"Scaling {x} by {factor}")
-    return x * factor
+def sum_pow(base: int, power: int) -> int:
+    return sum(
+        [1]*base**power
+    )
+    
 print("Process created")
 # usage:
 
-print("calling scale")
+print("calling sum_pow")
 for i in range(2):
-    out = scale(3, 3)
+    out = sum_pow(2, 22)
 print("output:", out)

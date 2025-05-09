@@ -1,220 +1,44 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
-use pyo3::types::{PyDict, PyTuple, PyFunction, PyModule, PyBytes};
-use pyo3::{PyAny, PyObject, Python, IntoPy};
-use pythonize::{pythonize, depythonize};
-use numpy::IntoPyArray;
-use numpy::PyArrayDyn;
-use numpy::PyArrayMethods;
-use serde_json::Value as JsonValue;
-use tempfile::tempfile;
-use bincode::config;
-use memmap2::{MmapMut, MmapOptions};
+use pyo3::types::{PyBytes, PyFunction, PyModule, PyTuple};
+use pyo3::Python;
 use ipc_channel::ipc;
 use std::sync::{Arc, Mutex};
 use nix::unistd::{fork, ForkResult};
 use pyo3::ffi;
 use std::process;
 
-// -------- 1) Type descriptors --------
-#[derive(Clone)]
-enum ArgSpec {
-    NdArray { dtype: String, len: Option<usize> },
-    Primitive(String),
-    Serde,
-}
-
-#[derive(Clone)]
-enum RetSpec {
-    NdArray { dtype: String, len: Option<usize> },
-    Primitive(String),
-    Serde,
-}
-
-// -------- 2) Shared-memory helper --------
-fn create_shm(size: usize) -> MmapMut {
-    let file = tempfile().unwrap();
-    file.set_len(size as u64).unwrap();
-    unsafe { MmapOptions::new().map_mut(&file).unwrap() }
-}
-
-// -------- 3) Parsing annotations --------
-// Update parse_arg_spec to handle Python type objects
-fn parse_arg_spec(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<ArgSpec> {
-    // Get string representation of the type object
-    let type_str = obj.repr()?.extract::<String>()?;
-    
-    if type_str.contains("ndarray") || type_str.contains("array") {
-        Ok(ArgSpec::NdArray { dtype: "f64".to_string(), len: None })
-    } else if type_str.contains("int") {
-        Ok(ArgSpec::Primitive("int".to_string()))
-    } else if type_str.contains("float") {
-        Ok(ArgSpec::Primitive("float".to_string()))
-    } else {
-        Ok(ArgSpec::Serde)
-    }
-}
-
-// Update parse_ret_spec to pass through the Python context
-fn parse_ret_spec(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<RetSpec> {
-    match parse_arg_spec(py, obj)? {
-        ArgSpec::NdArray { dtype, len } => Ok(RetSpec::NdArray { dtype, len }),
-        ArgSpec::Primitive(k) => Ok(RetSpec::Primitive(k)),
-        ArgSpec::Serde => Ok(RetSpec::Serde),
-    }
-}
-
-// -------- 4) Marshalling arguments --------
-fn marshal_args(
-    py: Python<'_>,
-    specs: &[ArgSpec],
-    maps: &[Arc<MmapMut>],
-    tuple: &Bound<'_, PyTuple>, 
-) -> PyResult<()> {
-    let args = tuple.iter().collect::<Vec<_>>();
-    for ((spec, map), arg) in specs.iter().zip(maps.iter()).zip(args.iter()) {
-        match spec {
-            ArgSpec::NdArray { .. } => {
-                // First convert to float64 array explicitly
-                let numpy = py.import("numpy")?;
-                let arr_obj = numpy.getattr("asarray")?.call1((arg, "float64"))?;
-                
-                // Now downcast to PyArray
-                let arr = arr_obj.downcast::<PyArrayDyn<f64>>()?;
-                let slice = unsafe { arr.as_slice()? };
-                
-                // Copy to shared memory
-                let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut f64, slice.len()) };
-                dest.copy_from_slice(slice);
-            }
-            ArgSpec::Primitive(kind) if kind == "int" => {
-                let v: i64 = arg.extract()?;
-                let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut u8, 8) };
-                dest.copy_from_slice(&v.to_le_bytes());
-            }
-            ArgSpec::Primitive(kind) if kind == "float" => {
-                let v: f64 = arg.extract()?;
-                let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut u8, 8) };
-                dest.copy_from_slice(&v.to_le_bytes());
-            }
-            ArgSpec::Serde => {
-                let val: JsonValue = depythonize(arg)?;
-                let bin = bincode::serde::encode_to_vec(&val, config::legacy())
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
-                let len = bin.len().min(map.len());
-                let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut u8, len) };
-                dest.copy_from_slice(&bin[..len]);
-            }
-            _ => return Err(PyValueError::new_err("Unsupported ArgSpec")),
-        }
-    }
-    Ok(())
-}
-
-// -------- 5) Unmarshalling args in child --------
-fn unmarshal_args(
-    py: Python<'_>,
-    specs: &[ArgSpec],
-    maps: &[Arc<MmapMut>],
-) -> PyResult<Vec<PyObject>> {
-    let mut out = Vec::with_capacity(specs.len());
-    for (spec, map) in specs.iter().zip(maps.iter()) {
-        let obj = match spec {
-            ArgSpec::NdArray { .. } => {
-                let n = map.len() / std::mem::size_of::<f64>();
-                let slice = unsafe { std::slice::from_raw_parts(map.as_ptr() as *const f64, n) };
-                slice.to_vec().into_pyarray(py).to_object(py)
-            }
-            ArgSpec::Primitive(kind) if kind == "int" => {
-                let mut buf = [0u8; 8]; buf.copy_from_slice(&map[..8]);
-                let v: i64 = i64::from_le_bytes(buf);
-                v.into_py(py)
-            }
-            ArgSpec::Primitive(kind) if kind == "float" => {
-                let mut buf = [0u8; 8]; buf.copy_from_slice(&map[..8]);
-                let v = f64::from_le_bytes(buf);
-                v.into_py(py)
-            }
-            ArgSpec::Serde => {
-                let len = map.iter().position(|&b| b == 0).unwrap_or(map.len());
-                let slice = &map[..len];
-                let val: JsonValue = bincode::serde::decode_from_slice(slice, config::legacy())
-                    .map_err(|e| PyValueError::new_err(e.to_string()))?
-                    .0;
-                pythonize(py, &val)?.into_py(py)
-            }
-            _ => return Err(PyValueError::new_err("Unsupported ArgSpec")),
-        };
-        out.push(obj);
-    }
-    Ok(out)
-}
-
-// -------- 6) Marshalling return in child --------
-fn marshal_ret(
-    spec: &RetSpec,
-    map: &Arc<MmapMut>,
-    ret: &Bound<'_, PyAny>,
-) -> PyResult<()> {
-    match spec {
-        RetSpec::NdArray { .. } => {
-            let arr = ret.downcast::<PyArrayDyn<f64>>()?;
-            let slice = unsafe { arr.as_slice()? };
-            let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut f64, slice.len()) };
-            dest.copy_from_slice(slice);
-        }
-        RetSpec::Primitive(kind) if kind == "int" => {
-            let v: i64 = ret.extract()?;
-            let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut u8, 8) };
-            dest.copy_from_slice(&v.to_le_bytes());
-        }
-        RetSpec::Primitive(kind) if kind == "float" => {
-            let v: f64 = ret.extract()?;
-            let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut u8, 8) };
-            dest.copy_from_slice(&v.to_le_bytes());
-        }
-        RetSpec::Serde => {
-            let val: JsonValue = depythonize(ret)?;
-            let bin = bincode::serde::encode_to_vec(&val, config::legacy())
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let len = bin.len().min(map.len());
-            let dest = unsafe { std::slice::from_raw_parts_mut(map.as_ptr() as *mut u8, len) };
-            dest.copy_from_slice(&bin[..len]);
-        }
-        _ => return Err(PyValueError::new_err("Unsupported RetSpec")),
-    }
-    Ok(())
-}
-
-// -------- 7) Child event loop with improved logging and signal handling --------
 #[derive(Clone)]
 struct FunctionInfo {
     module_name: String,
     function_name: String,
-    pickled_func: Vec<u8>,  // Add this field to store the pickled function
+    pickled_func: Vec<u8>,
+}
+
+struct IpcChannelBundle {
+    tx: ipc::IpcSender<Vec<u8>>,
+    rx: ipc::IpcReceiver<Vec<u8>>,
+}
+
+#[pyclass(unsendable)]
+struct Process {
+    channels: Arc<Mutex<IpcChannelBundle>>,
+    function_info: FunctionInfo,
+    child_pid: Option<nix::unistd::Pid>,
 }
 
 fn child_loop(
     function_info: FunctionInfo,
-    specs: Vec<ArgSpec>,
-    ret_spec: RetSpec,
-    in_maps: Vec<Arc<MmapMut>>,
-    out_map: Arc<MmapMut>,
-    rx: ipc::IpcReceiver<()>,
-    tx: ipc::IpcSender<()>,
+    rx: ipc::IpcReceiver<Vec<u8>>,
+    tx: ipc::IpcSender<Vec<u8>>,
 ) {
     println!("[CHILD] Starting child loop with PID: {}", process::id());
-    
-    match tx.send(()) {
-        Ok(_) => println!("[CHILD] Sent initialization signal to parent"),
-        Err(e) => println!("[CHILD] Failed to signal parent: {:?}", e),
+    // Signal parent that we have initialized.
+    if let Err(e) = tx.send(vec![]) {
+        println!("[CHILD] Failed to send initialization signal: {:?}", e);
     }
-    
-    // In forked process, use regular Python::with_gil instead of embedded interpreter
+
     Python::with_gil(|py| {
-        println!("[CHILD] Acquired GIL for child process");
-        
-        // Unpickle the function using cloudpickle
         println!("[CHILD] Unpickling function with cloudpickle");
         let func = match || -> PyResult<Bound<'_, PyFunction>> {
             let cloudpickle = PyModule::import(py, "cloudpickle")?;
@@ -228,267 +52,172 @@ fn child_loop(
                 return;
             }
         };
-        
         println!("[CHILD] Function unpickled successfully: {}", function_info.function_name);
+        
+        let cloudpickle = match py.import("cloudpickle") {
+            Ok(m) => m,
+            Err(e) => {
+                println!("[CHILD] Error importing cloudpickle: {:?}", e);
+                return;
+            }
+        };
+        let dumps = match cloudpickle.getattr("dumps") {
+            Ok(d) => d,
+            Err(e) => {
+                println!("[CHILD] Error getting dumps method: {:?}", e);
+                return;
+            }
+        };
+        let loads = match cloudpickle.getattr("loads") {
+            Ok(l) => l,
+            Err(e) => {
+                println!("[CHILD] Error getting loads method: {:?}", e);
+                return;
+            }
+        };
 
         loop {
-            // Check for Python interrupts
-            if py.check_signals().is_err() {
-                println!("[CHILD] Received Python interrupt signal, exiting loop");
-                // Try to unblock parent if it's waiting
-                let _ = tx.send(());
-                break;
-            }
-            
-            println!("[CHILD] Waiting for message from parent");
-            match rx.recv() {
-                Ok(_) => {
-                    println!("[CHILD] Message received, processing");
-                    
-                    // Unmarshal args with error logging
-                    let args = match unmarshal_args(py, &specs, &in_maps) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            println!("[CHILD] Error unmarshaling args: {:?}", e);
-                            // Notify parent of failure
-                            let _ = tx.send(());
-                            continue;
-                        }
-                    };
-                    
-                    println!("[CHILD] Args unmarshaled, calling function");
-                    
-                    // Create a proper Python tuple from the args vector
-                    let args_tuple = match PyTuple::new(py, &args) {
-                        Ok(tuple) => tuple,
-                        Err(e) => {
-                            println!("[CHILD] Error creating args tuple: {:?}", e);
-                            // Notify parent of failure
-                            let _ = tx.send(());
-                            continue;
-                        }
-                    };
-
-                    // Call the function with the tuple properly unpacked as args
-                    let ret_py = match func.call(args_tuple, None) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            println!("[CHILD] Error calling function: {:?}", e);
-                            // Notify parent of failure
-                            let _ = tx.send(());
-                            continue;
-                        }
-                    };
-                    
-                    println!("[CHILD] Function executed, marshaling return value");
-                    
-                    // Marshal return with error logging
-                    match marshal_ret(&ret_spec, &out_map, &ret_py) {
-                        Ok(_) => println!("[CHILD] Return value marshaled successfully"),
-                        Err(e) => println!("[CHILD] Error marshaling return: {:?}", e),
-                    }
-                    
-                    println!("[CHILD] Sending completion signal to parent");
-                    
-                    // Send with error handling
-                    match tx.send(()) {
-                        Ok(_) => println!("[CHILD] Signal sent to parent"),
-                        Err(e) => println!("[CHILD] Failed to signal parent: {:?}", e),
-                    }
-                }
+            println!("[CHILD] Waiting for pickled arguments from parent...");
+            let pickled_args = match rx.recv() {
+                Ok(bytes) => bytes,
                 Err(e) => {
-                    println!("[CHILD] Error receiving message: {:?}, exiting loop", e);
+                    println!("[CHILD] Error receiving arguments: {:?}, exiting", e);
                     break;
                 }
-            }
+            };
+            // Unpickle the args to a Python object (expecting a tuple)
+            let args_obj = match loads.call1((PyBytes::new(py, &pickled_args),)) {
+                Ok(o) => o,
+                Err(e) => {
+                    println!("[CHILD] Error unpickling args: {:?}", e);
+                    continue;
+                }
+            };
+            let args_tuple = match args_obj.downcast::<PyTuple>() {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("[CHILD] Expected tuple of arguments, got error: {:?}", e);
+                    continue;
+                }
+            };
+            println!("[CHILD] Calling function with unpickled arguments");
+            let ret = match func.call(args_tuple, None) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("[CHILD] Error calling function: {:?}", e);
+                    continue;
+                }
+            };
+            // Pickle the return value and send it over IPC.
             
-            // Periodically check for interrupts
-            if py.check_signals().is_err() {
-                println!("[CHILD] Interrupt detected, exiting loop");
-                break;
+            let pickled_ret: Vec<u8> = match dumps.call1((ret,)) {
+                Ok(py_bytes) => match py_bytes.extract() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        println!("[CHILD] Error extracting pickled return: {:?}", e);
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    println!("[CHILD] Error pickling return value: {:?}", e);
+                    continue;
+                }
+            };
+            if let Err(e) = tx.send(pickled_ret) {
+                println!("[CHILD] Failed to send return value: {:?}", e);
             }
-        }
+        } // loop
         println!("[CHILD] Exiting child loop");
     });
-}
-
-// -------- 8) Process class with improved logging and error handling --------
-struct IpcChannelBundle {
-    tx: ipc::IpcSender<()>,
-    rx: ipc::IpcReceiver<()>,
-}
-
-#[pyclass(unsendable)]
-struct Process {
-    specs: Vec<ArgSpec>,
-    ret_spec: RetSpec,
-    in_maps: Vec<Arc<MmapMut>>,
-    out_map: Arc<MmapMut>,
-    channels: Arc<Mutex<IpcChannelBundle>>,
-    function_info: FunctionInfo,
-    child_pid: Option<nix::unistd::Pid>,  // Track child process PID
 }
 
 #[pymethods]
 impl Process {
     #[staticmethod]
-    #[pyo3(signature = (func))]
+    #[pyo3(signature=(func))]
     fn from_signature(py: Python<'_>, func: PyObject) -> PyResult<Self> {
         println!("[PARENT] Creating Process from signature");
         let func_ref = func.bind(py).downcast::<PyFunction>()?;
-        
-        // Extract module and function names
         let module_name = func_ref.getattr("__module__")?.extract::<String>()?;
         let function_name = func_ref.getattr("__name__")?.extract::<String>()?;
-        
         println!("[PARENT] Function identified: {}.{}", module_name, function_name);
-        
-        // Pickle the function using cloudpickle
-        println!("[PARENT] Pickling function with cloudpickle");
+        // Pickle the function with cloudpickle.
         let cloudpickle = py.import("cloudpickle")?;
-        let pickled_func = cloudpickle.getattr("dumps")?.call1((func.clone_ref(py),))?.extract::<Vec<u8>>()?;
-        
-        // Create FunctionInfo with pickled function
+        let pickled_func: Vec<u8> = cloudpickle.getattr("dumps")?
+            .call1((func.clone_ref(py),))?
+            .extract()?;
         let function_info = FunctionInfo {
             module_name,
             function_name,
             pickled_func,
         };
-        
-        let binding = func_ref.getattr("__annotations__")?;
-        let ann = binding.downcast::<PyDict>()?;
-        
-        let mut specs = Vec::new();
-        let mut ret_spec = RetSpec::Serde;
-        
-        println!("[PARENT] Parsing function annotations");
-        for (k, v) in ann.iter() {
-            let name: &str = k.extract()?;
-            if name == "return" {
-                ret_spec = parse_ret_spec(py, &v)?;
-                println!("[PARENT] Found return annotation");
-            } else {
-                specs.push(parse_arg_spec(py, &v)?);
-                println!("[PARENT] Found arg annotation for: {}", name);
-            }
-        }
-        
-        println!("[PARENT] Creating shared memory for {} arguments", specs.len());
-        let in_maps: Vec<Arc<MmapMut>> = specs.iter()
-            .map(|s| Arc::new(create_shm(match s { ArgSpec::NdArray {..} => 8*1024, _ => 4*1024 })))
-            .collect();
-            
-        let out_map = Arc::new(create_shm(match ret_spec { RetSpec::NdArray {..} => 8*1024, _ => 4*1024 }));
+
         println!("[PARENT] Setting up IPC channels");
-        let (tx_p, rx_c) = ipc::channel().unwrap();
-        let (tx_c, rx_p) = ipc::channel().unwrap();
-        
-        let specs_clone = specs.clone();
-        let ret_spec_clone = ret_spec.clone();
-        let in_maps_clone = in_maps.clone();
-        let out_map_clone = out_map.clone();
-        let function_info_clone = function_info.clone();
-        
-        // REPLACE thread spawn with fork
+        let (tx_p, rx_c): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) = ipc::channel().unwrap();
+        let (tx_c, rx_p): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) = ipc::channel().unwrap();
+
+        // Fork the child process.
         println!("[PARENT] Forking child process");
         match unsafe { fork() } {
             Ok(ForkResult::Parent { child }) => {
                 println!("[PARENT] Forked child process with PID: {}", child);
-                
-                // Wait for child initialization
-                println!("[PARENT] Waiting for child process to initialize");
-                match rx_p.try_recv_timeout(std::time::Duration::from_secs(20)) {
+                // Wait for the child's initialization signal.
+                match rx_p.recv() {
                     Ok(_) => println!("[PARENT] Child process initialized successfully"),
                     Err(e) => return Err(PyValueError::new_err(format!("Child process failed to initialize: {:?}", e))),
                 }
-                
                 let channels = Arc::new(Mutex::new(IpcChannelBundle { tx: tx_p, rx: rx_p }));
                 println!("[PARENT] Process setup complete");
                 Ok(Process { 
-                    specs, ret_spec, in_maps, out_map, 
-                    channels, // store it
+                    channels, 
                     function_info,
-                    child_pid: Some(child) 
+                    child_pid: Some(child),
                 })
             },
             Ok(ForkResult::Child) => {
-                // In child process
                 println!("[CHILD] Child process forked with PID: {}", process::id());
-                
-                // Fix Python's internal state after fork
                 unsafe { ffi::PyOS_AfterFork_Child() };
-                
-                // Run child loop directly
-                child_loop(
-                    function_info_clone, specs_clone, ret_spec_clone, 
-                    in_maps_clone, out_map_clone, rx_c, tx_c
-                );
-                
-                // Exit the child process
+                child_loop(function_info, rx_c, tx_c);
                 process::exit(0);
             },
             Err(e) => return Err(PyValueError::new_err(format!("Fork failed: {}", e))),
         }
     }
 
-    #[pyo3(signature = (*args,))]
+    #[pyo3(signature=(*args,))]
     fn __call__(&mut self, py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<PyObject> {
         println!("[PARENT] Calling process function");
-
-        marshal_args(py, &self.specs, &self.in_maps, &args)
-            .map_err(|e| PyValueError::new_err(format!("Failed to marshal arguments: {:?}", e)))?;
-
-        py.allow_threads(|| {
+        // Pickle the arguments using cloudpickle.
+        let pickled_args: Vec<u8> = Python::with_gil(|py| {
+            let cloudpickle = py.import("cloudpickle")?;
+            let dumps = cloudpickle.getattr("dumps")?;
+            let py_bytes = dumps.call1((args,))?;
+            py_bytes.extract()
+        })?;
+        let pickled_ret: Vec<u8> = py.allow_threads(|| {
             let lock = self.channels.lock().map_err(|e| e.to_string())?;
-            lock.tx.send(()).map_err(|e| e.to_string())?;
-            lock.rx.recv().map_err(|e| e.to_string())?;
-            Ok(())
+            lock.tx.send(pickled_args).map_err(|e| e.to_string())?;
+            // Wait for the child to send back the pickled return value.
+            lock.rx.recv().map_err(|e| e.to_string())
         })
         .map_err(|err_str: String| PyValueError::new_err(err_str))?;
-
-        println!("[PARENT] Processing return value");
-        let result = match &self.ret_spec {
-            RetSpec::NdArray {..} => {
-                println!("[PARENT] Handling ndarray return");
-                let n = self.out_map.len() / std::mem::size_of::<f64>();
-                let slice = unsafe { std::slice::from_raw_parts(self.out_map.as_ptr() as *const f64, n) };
-                slice.to_vec().into_pyarray(py).into_py(py)
-            }
-            RetSpec::Primitive(kind) if kind=="int" => {
-                println!("[PARENT] Handling int return");
-                let mut buf=[0u8;8];
-                buf.copy_from_slice(&self.out_map[..8]);
-                let v = i64::from_le_bytes(buf);
-                v.to_object(py)
-            }
-            RetSpec::Primitive(kind) if kind=="float" => {
-                println!("[PARENT] Handling float return");
-                let mut buf=[0u8;8];
-                buf.copy_from_slice(&self.out_map[..8]);
-                let v = f64::from_le_bytes(buf);
-                v.to_object(py)
-            }
-            RetSpec::Serde => {
-                println!("[PARENT] Handling serde return");
-                let len = self.out_map.iter().position(|&b|b==0).unwrap_or(self.out_map.len());
-                let slice = &self.out_map[..len];
-                let val: JsonValue = match bincode::serde::decode_from_slice(slice, config::legacy()) {
-                    Ok((v, _)) => v,
-                    Err(e) => return Err(PyValueError::new_err(format!("Failed to decode return value: {:?}", e))),
-                };
-                pythonize(py, &val)?.to_object(py)
-            }
-            _ => return Err(PyValueError::new_err("Unsupported RetSpec")),
-        };
-
+        // Unpickle the return value.
+        let py_ret = Python::with_gil(|py| {
+            let cloudpickle = py.import("cloudpickle")?;
+            let loads = cloudpickle.getattr("loads")?;
+            let obj = loads.call1((PyBytes::new(py, &pickled_ret),))?;
+            let val = obj.extract()
+                .map_err(|e| PyValueError::new_err(format!("Failed to unpickle return value: {:?}", e)));
+            val
+        })?;
         println!("[PARENT] Call complete, returning result");
-        Ok(result)
+        Ok(py_ret)
     }
     
     fn cleanup(&mut self) -> PyResult<()> {
         println!("[PARENT] Cleanup called, terminating child process");
         drop(self.channels.clone());
-        
+
         // Send signal to terminate child if needed
         if let Some(pid) = self.child_pid {
             match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
@@ -496,7 +225,6 @@ impl Process {
                 Err(e) => println!("[PARENT] Failed to send SIGTERM: {:?}", e),
             }
         }
-        
         Ok(())
     }
 }
