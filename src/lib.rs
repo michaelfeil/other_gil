@@ -28,8 +28,8 @@ struct ReplicaProcessInfo {
     child_pid: nix::unistd::Pid,
 }
 
-#[pyclass(unsendable)]
-struct Process {
+#[pyclass()]
+struct AsyncPool {
     child_processes: Vec<Arc<Mutex<ReplicaProcessInfo>>>,
     function_info: FunctionInfo, // Cloned into each child process
     next_replica_idx: Arc<Mutex<usize>>, // For round-robin load balancing
@@ -153,14 +153,14 @@ fn child_loop(
 }
 
 #[pymethods]
-impl Process {
+impl AsyncPool {
     #[staticmethod]
     #[pyo3(signature=(func, *, replicas = 8))]
     fn wraps(py: Python<'_>, func: PyObject, replicas: usize) -> PyResult<Self> {
         if replicas == 0 {
             return Err(PyValueError::new_err("Number of replicas must be at least 1"));
         }
-        info!("[PARENT] Creating Process from signature with {} replicas", replicas);
+        info!("[PARENT] Creating AsyncPool from signature with {} replicas", replicas);
 
         let func_ref = func.bind(py).downcast::<PyFunction>()?;
         let module_name = func_ref.getattr("__module__")?.extract::<String>()?;
@@ -228,7 +228,7 @@ impl Process {
         }
 
         info!("[PARENT] All {} replica processes setup complete", replicas);
-        Ok(Process {
+        Ok(AsyncPool {
             child_processes: all_replica_infos,
             function_info, // Original function_info stored, cloned version passed to children
             next_replica_idx: Arc::new(Mutex::new(0)),
@@ -242,7 +242,7 @@ impl Process {
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'p, PyAny>> {
         if self.child_processes.is_empty() {
-            error!("[PARENT] __call__ invoked on a Process with no replicas.");
+            error!("[PARENT] __call__ invoked on a AsyncPool with no replicas.");
             return Err(PyValueError::new_err("No replicas available to handle the call."));
         }
         
@@ -345,10 +345,10 @@ impl Process {
     }
 }
 
-// Add Drop implementation for Process
-impl Drop for Process {
+// Add Drop implementation for AsyncPool
+impl Drop for AsyncPool {
     fn drop(&mut self) {
-        info!("[PARENT] Process is being dropped, cleaning up");
+        info!("[PARENT] AsyncPool is being dropped, cleaning up");
         let _ = self.cleanup();
     }
 }
@@ -361,6 +361,6 @@ fn gilboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Or simply:
     let _ = env_logger::try_init(); // Use try_init to avoid panic if already initialized
     info!("[MODULE] Initializing other_gil module");
-    m.add_class::<Process>()?;
+    m.add_class::<AsyncPool>()?;
     Ok(())
 }

@@ -1,4 +1,4 @@
-from gilboost import Process
+from gilboost import AsyncPool
 import asyncio
 import time
 
@@ -12,7 +12,7 @@ async def sum_pow(base: int, power: int) -> int:
     await asyncio.sleep(0.1)
     return _sum_pow(base, power)
 
-sum_pow = Process.wraps(sum_pow, replicas=8)
+sum_pow = AsyncPool.wraps(sum_pow, replicas=8)
     
 async def vanilla_sum_pow(base: int, power: int) -> int:
     await asyncio.sleep(0.1)
