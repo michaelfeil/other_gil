@@ -8,10 +8,10 @@ use pyo3::Python;
 use std::process;
 use std::sync::{Arc, Mutex};
 use log::{info, warn, error, trace, debug};
+use serde::{Serialize, Deserialize}; 
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)] 
 struct FunctionInfo {
-    module_name: String,
     function_name: String,
     pickled_func: Vec<u8>,
 }
@@ -31,7 +31,6 @@ struct ReplicaProcessInfo {
 #[pyclass()]
 struct AsyncPool {
     child_processes: Vec<Arc<Mutex<ReplicaProcessInfo>>>,
-    function_info: FunctionInfo, // Cloned into each child process
     next_replica_idx: Arc<Mutex<usize>>, // For round-robin load balancing
 }
 
@@ -163,11 +162,10 @@ impl AsyncPool {
         info!("[PARENT] Creating AsyncPool from signature with {} replicas", replicas);
 
         let func_ref = func.bind(py).downcast::<PyFunction>()?;
-        let module_name = func_ref.getattr("__module__")?.extract::<String>()?;
         let function_name = func_ref.getattr("__name__")?.extract::<String>()?;
         info!(
-            "[PARENT] Function identified: {}.{}",
-            module_name, function_name
+            "[PARENT] Function identified: {}",
+            function_name
         );
         let cloudpickle = py.import("cloudpickle")?;
         let pickled_func: Vec<u8> = cloudpickle
@@ -175,7 +173,6 @@ impl AsyncPool {
             .call1((func.clone_ref(py),))?
             .extract()?;
         let function_info = FunctionInfo {
-            module_name,
             function_name,
             pickled_func,
         };
@@ -230,7 +227,6 @@ impl AsyncPool {
         info!("[PARENT] All {} replica processes setup complete", replicas);
         Ok(AsyncPool {
             child_processes: all_replica_infos,
-            function_info, // Original function_info stored, cloned version passed to children
             next_replica_idx: Arc::new(Mutex::new(0)),
         })
     }
@@ -297,7 +293,7 @@ impl AsyncPool {
                         info!("[PARENT] IPC successful, unpickling result");
                         let cloudpickle = py_inner.import("cloudpickle")?;
                         let loads = cloudpickle.getattr("loads")?;
-                        let py_bytes_ret = PyBytes::new_bound(py_inner, &pickled_ret);
+                        let py_bytes_ret = PyBytes::new(py_inner, &pickled_ret);
                         let bound_obj = loads.call1((py_bytes_ret,))?;
                         Ok(bound_obj.to_object(py_inner)) // Convert to PyObject
                     })
