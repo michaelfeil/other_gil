@@ -173,7 +173,7 @@ impl Process {
     }
 
     #[pyo3(signature=(*args,))]
-    fn __call__(&mut self, py: Python<'_>, args: Bound<'_, PyTuple>) -> PyResult<PyObject> {
+    fn __call__<'p>(&mut self, py: Python<'p>, args: Bound<'_, PyTuple>) -> PyResult<Bound<'p, PyAny>> {
         println!("[PARENT] Calling process function");
         // Pickle the arguments using cloudpickle.
         let pickled_args: Vec<u8> = Python::with_gil(|py| {
@@ -189,17 +189,22 @@ impl Process {
             lock.rx.recv().map_err(|e| e.to_string())
         })
         .map_err(|err_str: String| PyValueError::new_err(err_str))?;
+        
         // Unpickle the return value.
-        let py_ret = Python::with_gil(|py| {
-            let cloudpickle = py.import("cloudpickle")?;
-            let loads = cloudpickle.getattr("loads")?;
-            let obj = loads.call1((PyBytes::new(py, &pickled_ret),))?;
-            let val = obj.extract()
-                .map_err(|e| PyValueError::new_err(format!("Failed to unpickle return value: {:?}", e)));
-            val
-        })?;
         println!("[PARENT] Call complete, returning result");
-        Ok(py_ret)
+        
+        // Store the pickled data in a variable that can be moved into the async block
+        let pickled_data = pickled_ret.clone();
+        
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Python::with_gil(|py_inner| { // py_inner is a new Python token for this GIL-acquired scope
+                let cloudpickle = py_inner.import("cloudpickle")?;
+                let loads = cloudpickle.getattr("loads")?;
+                let bound_obj = loads.call1((PyBytes::new(py_inner, &pickled_data),))?;
+                // Convert the Bound object (tied to py_inner) into an owned PyObject.
+                Ok(bound_obj.to_object(py_inner))
+            })
+        })
     }
     
     fn cleanup(&mut self) -> PyResult<()> {
