@@ -40,9 +40,18 @@ fn child_loop(
 
     Python::with_gil(|py| {
         println!("[CHILD] Unpickling function with cloudpickle");
+        let cloudpickle = match py.import("cloudpickle") {
+            Ok(m) => m,
+            Err(e) => {
+                println!("[CHILD] Error importing cloudpickle: {:?}", e);
+                return;
+            }
+        };
+        let dumps = cloudpickle.getattr("dumps").unwrap();
+        let loads = cloudpickle.getattr("loads").unwrap();
+
         let func = match || -> PyResult<Bound<'_, PyFunction>> {
-            let cloudpickle = PyModule::import(py, "cloudpickle")?;
-            let unpickled = cloudpickle.getattr("loads")?.call1((PyBytes::new(py, &function_info.pickled_func),))?;
+            let unpickled = loads.call1((PyBytes::new(py, &function_info.pickled_func),))?;
             let func = unpickled.downcast::<PyFunction>()?;
             Ok(func.clone())
         }() {
@@ -54,27 +63,6 @@ fn child_loop(
         };
         println!("[CHILD] Function unpickled successfully: {}", function_info.function_name);
         
-        let cloudpickle = match py.import("cloudpickle") {
-            Ok(m) => m,
-            Err(e) => {
-                println!("[CHILD] Error importing cloudpickle: {:?}", e);
-                return;
-            }
-        };
-        let dumps = match cloudpickle.getattr("dumps") {
-            Ok(d) => d,
-            Err(e) => {
-                println!("[CHILD] Error getting dumps method: {:?}", e);
-                return;
-            }
-        };
-        let loads = match cloudpickle.getattr("loads") {
-            Ok(l) => l,
-            Err(e) => {
-                println!("[CHILD] Error getting loads method: {:?}", e);
-                return;
-            }
-        };
 
         loop {
             println!("[CHILD] Waiting for pickled arguments from parent...");
