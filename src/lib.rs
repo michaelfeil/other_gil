@@ -16,16 +16,23 @@ struct FunctionInfo {
     pickled_func: Vec<u8>,
 }
 
-struct IpcChannelBundle {
-    tx: ipc::IpcSender<Vec<u8>>,
-    rx: ipc::IpcReceiver<Vec<u8>>,
+// Parent's view of IPC channels for one replica
+struct ParentEndChannels {
+    tx_to_child: ipc::IpcSender<Vec<u8>>,   // Parent sends arguments to child
+    rx_from_child: ipc::IpcReceiver<Vec<u8>>, // Parent receives results from child
+}
+
+// Information about a single replica process
+struct ReplicaProcessInfo {
+    ipc_channels: ParentEndChannels,
+    child_pid: nix::unistd::Pid,
 }
 
 #[pyclass(unsendable)]
 struct Process {
-    channels: Arc<Mutex<IpcChannelBundle>>,
-    function_info: FunctionInfo,
-    child_pid: Option<nix::unistd::Pid>,
+    child_processes: Vec<Arc<Mutex<ReplicaProcessInfo>>>,
+    function_info: FunctionInfo, // Cloned into each child process
+    next_replica_idx: Arc<Mutex<usize>>, // For round-robin load balancing
 }
 
 fn child_loop(
@@ -148,9 +155,13 @@ fn child_loop(
 #[pymethods]
 impl Process {
     #[staticmethod]
-    #[pyo3(signature=(func))]
-    fn from_signature(py: Python<'_>, func: PyObject) -> PyResult<Self> {
-        info!("[PARENT] Creating Process from signature");
+    #[pyo3(signature=(func, *, replicas = 8))]
+    fn wraps(py: Python<'_>, func: PyObject, replicas: usize) -> PyResult<Self> {
+        if replicas == 0 {
+            return Err(PyValueError::new_err("Number of replicas must be at least 1"));
+        }
+        info!("[PARENT] Creating Process from signature with {} replicas", replicas);
+
         let func_ref = func.bind(py).downcast::<PyFunction>()?;
         let module_name = func_ref.getattr("__module__")?.extract::<String>()?;
         let function_name = func_ref.getattr("__name__")?.extract::<String>()?;
@@ -158,7 +169,6 @@ impl Process {
             "[PARENT] Function identified: {}.{}",
             module_name, function_name
         );
-        // Pickle the function with cloudpickle.
         let cloudpickle = py.import("cloudpickle")?;
         let pickled_func: Vec<u8> = cloudpickle
             .getattr("dumps")?
@@ -170,52 +180,59 @@ impl Process {
             pickled_func,
         };
 
-        debug!("[PARENT] Setting up IPC channels");
-        let (tx_p, rx_c): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
-            ipc::channel().unwrap();
-        let (tx_c, rx_p): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
-            ipc::channel().unwrap();
+        let mut all_replica_infos = Vec::with_capacity(replicas);
 
-        // Fork the child process.
-        info!("[PARENT] Forking child process");
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child }) => {
-                info!("[PARENT] Forked child process with PID: {}", child);
-                // Wait for the child's initialization signal.
-                match rx_p.recv() {
-                    Ok(_) => info!("[PARENT] Child process initialized successfully"),
-                    Err(e) => {
-                        error!("[PARENT] Child process failed to initialize: {:?}", e);
-                        return Err(PyValueError::new_err(format!(
-                            "Child process failed to initialize: {:?}",
-                            e
-                        )))
+        for i in 0..replicas {
+            debug!("[PARENT] Setting up IPC channels for replica {}", i + 1);
+            // tx_args_p: parent sends arguments, rx_args_c: child receives arguments
+            let (tx_args_p, rx_args_c): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
+                ipc::channel().map_err(|e| PyValueError::new_err(format!("Failed to create args IPC channel: {}", e)))?;
+            // tx_res_c: child sends results, rx_res_p: parent receives results (and init signal)
+            let (tx_res_c, rx_res_p): (ipc::IpcSender<Vec<u8>>, ipc::IpcReceiver<Vec<u8>>) =
+                ipc::channel().map_err(|e| PyValueError::new_err(format!("Failed to create results IPC channel: {}", e)))?;
+
+            info!("[PARENT] Forking child process {}/{}", i + 1, replicas);
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child }) => {
+                    info!("[PARENT] Forked child process {}/{} with PID: {}", i + 1, replicas, child);
+                    // Wait for the child's initialization signal on its result channel.
+                    match rx_res_p.recv() {
+                        Ok(_) => info!("[PARENT] Child process {} ({}) initialized successfully", i + 1, child),
+                        Err(e) => {
+                            error!("[PARENT] Child process {} ({}) failed to initialize: {:?}", i + 1, child, e);
+                            // TODO: Terminate already started children before erroring out.
+                            // For now, if one child fails, the whole setup fails.
+                            return Err(PyValueError::new_err(format!(
+                                "Child process {} ({}) failed to initialize: {:?}",
+                                i + 1, child, e
+                            )));
+                        }
                     }
+                    let parent_channels = ParentEndChannels { tx_to_child: tx_args_p, rx_from_child: rx_res_p };
+                    let replica_info = ReplicaProcessInfo { ipc_channels: parent_channels, child_pid: child };
+                    all_replica_infos.push(Arc::new(Mutex::new(replica_info)));
                 }
-                let channels = Arc::new(Mutex::new(IpcChannelBundle { tx: tx_p, rx: rx_p }));
-                info!("[PARENT] Process setup complete");
-                Ok(Process {
-                    channels,
-                    function_info,
-                    child_pid: Some(child),
-                })
+                Ok(ForkResult::Child) => {
+                    info!("[CHILD] Child process forked with PID: {} (replica {}/{})", process::id(), i + 1, replicas);
+                    unsafe { ffi::PyOS_AfterFork_Child() };
+                    // Child uses rx_args_c to receive arguments and tx_res_c to send results (and init signal)
+                    child_loop(function_info.clone(), rx_args_c, tx_res_c);
+                    process::exit(0);
+                }
+                Err(e) => {
+                    error!("[PARENT] Fork failed for replica {}: {}", i + 1, e);
+                    // TODO: Terminate already started children.
+                    return Err(PyValueError::new_err(format!("Fork failed for replica {}: {}", i + 1, e)));
+                }
             }
-            Ok(ForkResult::Child) => {
-                info!("[CHILD] Child process forked with PID: {}", process::id());
-                // It's good practice to re-initialize the logger in the child process
-                // if the parent had initialized it, especially if it involves file handles
-                // or other resources that might not be correctly inherited or shared after fork.
-                // However, env_logger typically writes to stderr, which should be fine.
-                // For more complex logging setups, consider explicit re-initialization.
-                unsafe { ffi::PyOS_AfterFork_Child() };
-                child_loop(function_info, rx_c, tx_c);
-                process::exit(0);
-            }
-            Err(e) => {
-                error!("[PARENT] Fork failed: {}", e);
-                return Err(PyValueError::new_err(format!("Fork failed: {}", e)))
-            },
         }
+
+        info!("[PARENT] All {} replica processes setup complete", replicas);
+        Ok(Process {
+            child_processes: all_replica_infos,
+            function_info, // Original function_info stored, cloned version passed to children
+            next_replica_idx: Arc::new(Mutex::new(0)),
+        })
     }
 
     #[pyo3(signature=(*args,))]
@@ -224,7 +241,23 @@ impl Process {
         py: Python<'p>,
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        info!("[PARENT] Calling process function");
+        if self.child_processes.is_empty() {
+            error!("[PARENT] __call__ invoked on a Process with no replicas.");
+            return Err(PyValueError::new_err("No replicas available to handle the call."));
+        }
+        
+        let replica_arc = {
+            let mut idx_guard = self.next_replica_idx.lock().unwrap_or_else(|e| {
+                error!("[PARENT] Failed to lock next_replica_idx: {}", e);
+                // Fallback or panic, here we panic as it's a critical state.
+                // In a real scenario, might try to recover or return a specific error.
+                panic!("Failed to lock next_replica_idx: {}", e);
+            });
+            let current_idx = *idx_guard;
+            *idx_guard = (current_idx + 1) % self.child_processes.len();
+            debug!("[PARENT] Selected replica {} for call", current_idx);
+            self.child_processes[current_idx].clone()
+        };
 
         let pickled_args: Vec<u8> = {
             let cloudpickle = py.import("cloudpickle")?;
@@ -233,33 +266,30 @@ impl Process {
             py_bytes.extract()?
         };
 
-        let channels_clone = self.channels.clone(); // Clone Arc for the async block
-
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Perform blocking IPC operations in a separate thread managed by Tokio
             let ipc_task_result = tokio::task::spawn_blocking(move || {
-                let guard = channels_clone.lock().map_err(|e| {
-                    let msg = format!("Failed to acquire channel lock: {}", e);
+                // Lock the specific replica's info
+                let guard = replica_arc.lock().map_err(|e| {
+                    let msg = format!("Failed to acquire replica channel lock: {}", e);
                     error!("[PARENT] {}", msg);
                     msg 
                 })?;
-                trace!("[PARENT] Sending pickled arguments to child");
-                guard.tx.send(pickled_args).map_err(|e| {
-                    let msg = format!("Failed to send arguments to child: {}", e);
+                
+                trace!("[PARENT] Sending pickled arguments to child PID {}", guard.child_pid);
+                guard.ipc_channels.tx_to_child.send(pickled_args).map_err(|e| {
+                    let msg = format!("Failed to send arguments to child {}: {}", guard.child_pid, e);
                     error!("[PARENT] {}", msg);
                     msg
                 })?;
-                debug!("[PARENT] Waiting for pickled return value from child");
-                guard.rx.recv().map_err(|e| {
-                    let msg = format!("Failed to receive data from child: {}", e);
+                
+                debug!("[PARENT] Waiting for pickled return value from child PID {}", guard.child_pid);
+                guard.ipc_channels.rx_from_child.recv().map_err(|e| {
+                    let msg = format!("Failed to receive data from child {}: {}", guard.child_pid, e);
                     error!("[PARENT] {}", msg);
                     msg
                 })
-                // This closure returns Result<Vec<u8>, String>
             }).await;
 
-            // ipc_task_result is Result<Result<Vec<u8>, String>, tokio::task::JoinError>
-            // The async block must return PyResult<PyObject>
             match ipc_task_result {
                 Ok(Ok(pickled_ret)) => { // IPC successful, inner result is Ok(Vec<u8>)
                     // Unpickle the return value. This requires the GIL.
@@ -286,16 +316,31 @@ impl Process {
     }
 
     fn cleanup(&mut self) -> PyResult<()> {
-        info!("[PARENT] Cleanup called, terminating child process");
-        drop(self.channels.clone());
-
-        // Send signal to terminate child if needed
-        if let Some(pid) = self.child_pid {
-            match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
-                Ok(_) => info!("[PARENT] Sent SIGTERM to child process {}", pid),
-                Err(e) => warn!("[PARENT] Failed to send SIGTERM to child {}: {:?}", pid, e),
+        info!("[PARENT] Cleanup called, terminating {} child process(es)", self.child_processes.len());
+        
+        for (i, replica_arc) in self.child_processes.iter().enumerate() {
+            match replica_arc.try_lock() { // Use try_lock to avoid blocking if a child is stuck holding the lock (unlikely here)
+                Ok(replica_info) => {
+                    info!("[PARENT] Terminating child process {} (PID: {})", i, replica_info.child_pid);
+                    match nix::sys::signal::kill(replica_info.child_pid, nix::sys::signal::Signal::SIGTERM) {
+                        Ok(_) => info!("[PARENT] Sent SIGTERM to child process PID {}", replica_info.child_pid),
+                        Err(e) => warn!("[PARENT] Failed to send SIGTERM to child PID {}: {:?}", replica_info.child_pid, e),
+                    }
+                }
+                Err(e) => {
+                    // If we can't lock, we might not have the PID. This case should be rare.
+                    // The PID is not mutable after creation, so lock is mainly for channel access.
+                    // However, to be safe, we only kill if lock is acquired.
+                    // Alternatively, store PIDs separately if cleanup needs to happen without lock.
+                    // For now, log and continue.
+                    warn!("[PARENT] Could not lock replica info for child {} during cleanup: {}. Skipping termination signal for this replica.", i, e);
+                }
             }
         }
+        // Clear the vector, which will drop the Arcs. If these are the last Arcs,
+        // the Mutex<ReplicaProcessInfo> and then ReplicaProcessInfo (and its channels) will be dropped.
+        self.child_processes.clear();
+        info!("[PARENT] Child processes cleanup attempt finished.");
         Ok(())
     }
 }
@@ -309,7 +354,7 @@ impl Drop for Process {
 }
 
 #[pymodule]
-fn other_gil(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn gilboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize the logger. You can customize this further if needed.
     // For example, to set a default log level if RUST_LOG is not set:
     // env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
