@@ -14,6 +14,7 @@ async def main():
     
     print("Starting process")
     result = await sum_pow(2, 10)
+    result = await sum_pow(2, 27)
     print(f"Result: {result}")
     print("Process finished")
 
