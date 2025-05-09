@@ -83,12 +83,6 @@ fn child_loop(
     };
     info!("[CHILD PID {}] Received and deserialized FunctionInfo for: {}", child_pid, function_info.function_name);
 
-    if let Err(e) = tx_to_parent.send(vec![]) {
-        error!("[CHILD PID {}] Failed to send initialization signal: {:?}", child_pid, e);
-        process::exit(1);
-    }
-    info!("[CHILD PID {}] Sent initialization signal to parent.", child_pid);
-
     Python::with_gil(|py| {
         info!("[CHILD PID {}] Unpickling function '{}' with cloudpickle", child_pid, function_info.function_name);
         let cloudpickle = match py.import("cloudpickle") {
@@ -209,6 +203,13 @@ fn child_process_entry_point(
     let tx_to_parent = IpcSender::<Vec<u8>>::connect(c2p_data_server_name.clone())
         .map_err(|e| PyValueError::new_err(format!("Child: Failed to connect C->P sender to data server ({}): {}", c2p_data_server_name, e)))?;
     info!("[CHILD_SPAWN_ENTRY PID {}] C->P channel setup complete. tx_to_parent is ready.", std::process::id());
+
+    if let Err(e) = tx_to_parent.send(vec![]) {
+        let err_msg = format!("Child: Failed to send initialization signal: {:?}", e);
+        error!("[CHILD_SPAWN_ENTRY PID {}] {}", std::process::id(), err_msg);
+        return Err(PyValueError::new_err(err_msg));
+    }
+    info!("[CHILD_SPAWN_ENTRY PID {}] Sent initialization signal to parent.", std::process::id());
 
     pyo3::prepare_freethreaded_python();
 
