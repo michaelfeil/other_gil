@@ -225,48 +225,63 @@ impl Process {
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'p, PyAny>> {
         info!("[PARENT] Calling process function");
-        // Pickle the arguments using cloudpickle.
-        let pickled_args: Vec<u8> = Python::with_gil(|py| {
+
+        let pickled_args: Vec<u8> = {
             let cloudpickle = py.import("cloudpickle")?;
             let dumps = cloudpickle.getattr("dumps")?;
             let py_bytes = dumps.call1((args,))?;
-            py_bytes.extract()
-        })?;
-        let pickled_ret: Vec<u8> = py
-            .allow_threads(|| {
-                let lock = self.channels.lock().map_err(|e| {
-                    error!("[PARENT] Failed to acquire channel lock: {}", e);
-                    e.to_string()
-                })?;
-                trace!("[PARENT] Sending pickled arguments to child");
-                lock.tx.send(pickled_args).map_err(|e| {
-                    error!("[PARENT] Failed to send arguments to child: {}", e);
-                    e.to_string()
-                })?;
-                // Wait for the child to send back the pickled return value.
-                debug!("[PARENT] Waiting for pickled return value from child");
-                lock.rx.recv().map_err(|e| {
-                    error!("[PARENT] Failed to receive return value from child: {}", e);
-                    e.to_string()
-                })
-            })
-            .map_err(|err_str: String| PyValueError::new_err(err_str))?;
+            py_bytes.extract()?
+        };
 
-        // Unpickle the return value.
-        info!("[PARENT] Call complete, returning result");
-
-        // Store the pickled data in a variable that can be moved into the async block
-        let pickled_data = pickled_ret.clone();
+        let channels_clone = self.channels.clone(); // Clone Arc for the async block
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Python::with_gil(|py_inner| {
-                // py_inner is a new Python token for this GIL-acquired scope
-                let cloudpickle = py_inner.import("cloudpickle")?;
-                let loads = cloudpickle.getattr("loads")?;
-                let bound_obj = loads.call1((PyBytes::new(py_inner, &pickled_data),))?;
-                // Convert the Bound object (tied to py_inner) into an owned PyObject.
-                Ok(bound_obj.to_object(py_inner))
-            })
+            // Perform blocking IPC operations in a separate thread managed by Tokio
+            let ipc_task_result = tokio::task::spawn_blocking(move || {
+                let guard = channels_clone.lock().map_err(|e| {
+                    let msg = format!("Failed to acquire channel lock: {}", e);
+                    error!("[PARENT] {}", msg);
+                    msg 
+                })?;
+                trace!("[PARENT] Sending pickled arguments to child");
+                guard.tx.send(pickled_args).map_err(|e| {
+                    let msg = format!("Failed to send arguments to child: {}", e);
+                    error!("[PARENT] {}", msg);
+                    msg
+                })?;
+                debug!("[PARENT] Waiting for pickled return value from child");
+                guard.rx.recv().map_err(|e| {
+                    let msg = format!("Failed to receive data from child: {}", e);
+                    error!("[PARENT] {}", msg);
+                    msg
+                })
+                // This closure returns Result<Vec<u8>, String>
+            }).await;
+
+            // ipc_task_result is Result<Result<Vec<u8>, String>, tokio::task::JoinError>
+            // The async block must return PyResult<PyObject>
+            match ipc_task_result {
+                Ok(Ok(pickled_ret)) => { // IPC successful, inner result is Ok(Vec<u8>)
+                    // Unpickle the return value. This requires the GIL.
+                    Python::with_gil(|py_inner| {
+                        info!("[PARENT] IPC successful, unpickling result");
+                        let cloudpickle = py_inner.import("cloudpickle")?;
+                        let loads = cloudpickle.getattr("loads")?;
+                        let py_bytes_ret = PyBytes::new_bound(py_inner, &pickled_ret);
+                        let bound_obj = loads.call1((py_bytes_ret,))?;
+                        Ok(bound_obj.to_object(py_inner)) // Convert to PyObject
+                    })
+                }
+                Ok(Err(ipc_err_str)) => { // IPC error (String) from the blocking task's Result
+                    // Error was already logged when ipc_err_str was created.
+                    Err(PyValueError::new_err(ipc_err_str))
+                }
+                Err(join_err) => { // Task join error (e.g., panic in spawn_blocking)
+                    let err_msg = format!("IPC task panicked or was cancelled: {}", join_err);
+                    error!("[PARENT] {}", err_msg);
+                    Err(PyValueError::new_err(err_msg))
+                }
+            }
         })
     }
 
