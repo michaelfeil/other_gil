@@ -521,27 +521,37 @@ except Exception as e:
         py: Python<'p>,
         args: Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let mut idx_guard = self.next_replica_idx.lock().unwrap();
-        let current_idx = *idx_guard;
-        *idx_guard = (current_idx + 1) % self.child_processes.len();
-        drop(idx_guard);
+        let args_pyobject = args.to_object(py);
 
-        let replica_info_arc = self.child_processes[current_idx].clone();
-
-        info!(
-            "[PARENT] Dispatching call to replica index: {}",
-            current_idx
-        );
-
-        let pickled_args: Vec<u8> = {
-            let cloudpickle = py.import("cloudpickle")?;
-            let dumps = cloudpickle.getattr("dumps")?;
-            let py_bytes = dumps.call1((args,))?;
-            py_bytes.extract()?
-        };
+        // Clone Arcs for moving into the async block
+        let next_replica_idx_clone = self.next_replica_idx.clone();
+        let child_processes_clone = self.child_processes.clone(); // Clones the Vec of Arcs
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            
             let ipc_task_result = tokio::task::spawn_blocking(move || {
+                // --- Start of moved logic ---
+                let mut idx_guard = next_replica_idx_clone.lock().unwrap();
+                let current_idx = *idx_guard;
+                *idx_guard = (current_idx + 1) % child_processes_clone.len();
+                drop(idx_guard);
+
+                let replica_info_arc = child_processes_clone[current_idx].clone();
+
+                info!(
+                    "[PARENT] Dispatching call to replica index: {}",
+                    current_idx
+                );
+
+                let pickled_args: Vec<u8> = Python::with_gil(|py_blocking| {
+                    let cloudpickle = py_blocking.import("cloudpickle")?;
+                    let dumps = cloudpickle.getattr("dumps")?;
+                    // Bind the PyObject to the current GIL context for pickling
+                    let py_bytes = dumps.call1((args_pyobject.bind(py_blocking),))?;
+                    py_bytes.extract()
+                })?; // Propagates PyErr if pickling fails
+                // --- End of moved logic ---
+
                 let replica_info_guard = replica_info_arc.lock().unwrap();
 
                 info!(

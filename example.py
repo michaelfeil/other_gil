@@ -15,7 +15,7 @@ async def sum_pow(base: int, power: int) -> int:
 sum_pow_process = AsyncPool.wraps(sum_pow, replicas=8)
     
 # benchmark 2*vanilla_sum_pow vs (vanilla_sum_pow + sum_pow)
-async def benchmark(n=8, exp=22):
+async def benchmark(n=128, exp=16):
 
     start = time.time()
 
