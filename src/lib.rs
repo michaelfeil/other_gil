@@ -49,7 +49,7 @@ fn create_ipc_setup_endpoints() -> PyResult<IpcSetupEndpoints> {
     })
 }
 
-fn child_loop(
+async fn child_loop(
     rx_from_parent: ipc::IpcReceiver<Vec<u8>>,
     tx_to_parent: ipc::IpcSender<Vec<u8>>,
 ) {
@@ -208,9 +208,7 @@ async fn child_process_entry_point(
 
     info!("[CHILD_SPAWN_ENTRY PID {}] IPC fully established. Calling child_loop.", std::process::id());
 
-    tokio::task::spawn_blocking(move || {
-        child_loop(rx_from_parent, tx_to_parent);
-    }).await.map_err(|e| PyValueError::new_err(format!("Child: Failed to spawn blocking task: {}", e)))?;
+    child_loop(rx_from_parent, tx_to_parent).await;
 
     Ok(())
 }
