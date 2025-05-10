@@ -28,13 +28,6 @@ struct ReplicaProcessInfo {
     ipc_channels: ParentEndChannels,
     child_pid: Pid,
 }
-
-#[pyclass()]
-struct AsyncPool {
-    child_processes: Vec<Arc<Mutex<ReplicaProcessInfo>>>,
-    next_replica_idx: Arc<Mutex<usize>>,
-}
-
 // Helper for parent to create setup servers for one child
 struct IpcSetupEndpoints {
     p2c_rendezvous_server: IpcOneShotServer<IpcSender<Vec<u8>>>,
@@ -222,21 +215,23 @@ fn child_process_entry_point(
 
 #[pyfunction]
 pub fn child(p2c_rendezvous_server_name: String, c2p_data_server_name: String) -> PyResult<()> {
-    let child_pid = std::process::id();
-    println!("[GILBOOST_CHILD PID {}] Starting child process", child_pid);
-
-    info!("[GILBOOST_CHILD] Detected child process environment variables.");
     info!("[GILBOOST_CHILD] P2C Rendezvous Server: {}", p2c_rendezvous_server_name);
     info!("[GILBOOST_CHILD] C2P Data Server: {}", c2p_data_server_name);
 
     child_process_entry_point(p2c_rendezvous_server_name, c2p_data_server_name)
 }
 
+#[pyclass()]
+struct AsyncPool {
+    child_processes: Vec<Arc<Mutex<ReplicaProcessInfo>>>,
+    next_replica_idx: Arc<Mutex<usize>>,
+}
+
 #[pymethods]
 impl AsyncPool {
     #[staticmethod]
-    #[pyo3(signature=(func, *, replicas = 8))]
-    fn wraps(py: Python<'_>, func: PyObject, replicas: usize) -> PyResult<Self> {
+    #[pyo3(signature=(func, *, replicas = 8, python_executable = None))]
+    fn wraps(py: Python<'_>, func: PyObject, replicas: usize, python_executable: Option<String>) -> PyResult<Self> {
         if replicas == 0 {
             return Err(PyValueError::new_err("Number of replicas must be at least 1"));
         }
@@ -257,11 +252,21 @@ impl AsyncPool {
         };
 
         let mut child_processes_info = Vec::with_capacity(replicas);
+        // this line selects the wrong interpreter if venv is active. How to improve TODO
+        let resolved_python_executable = match python_executable {
+            Some(path) => std::path::PathBuf::from(path),
+            None => {
+                let sys = py.import("sys")?;
+                let executable_path_str: String = sys.getattr("executable")?.extract()?;
+                std::path::PathBuf::from(executable_path_str)
+            }
+        };        
+        // make sure path exists
+        if !resolved_python_executable.exists() && !resolved_python_executable.is_file() {
+            return Err(PyValueError::new_err(format!("Python executable path does not exist: {:?}", resolved_python_executable)));
+        };
 
-        let current_exe = env::current_exe()
-            .map_err(|e| PyValueError::new_err(format!("Failed to get current executable path: {}", e)))?;
-
-        info!("[PARENT PID {}] Current executable for spawning children: {:?}", parent_pid, current_exe);
+        info!("[PARENT PID {}] Current executable for spawning children: {:?}", parent_pid, resolved_python_executable);
 
         for i in 0..replicas {
             let replica_id = i + 1;
@@ -272,13 +277,12 @@ impl AsyncPool {
             let function_info_clone = function_info.clone();
 
             info!("[PARENT PID {}] Spawning childs process {}/{}", parent_pid, replica_id, replicas);
-            let mut cmd = Command::new(&current_exe);
+            let mut cmd = Command::new(&resolved_python_executable);
             cmd.arg("-c")
                 .arg(format!(r#"
 import os, sys, traceback
 try:
     import gilboost 
-    print("[GILBOOST_CHILD] Importing gilboost in child process", os.getpid())
     gilboost.child("{}", "{}")
 except Exception as e:
     traceback.print_exc(file=sys.stderr)
@@ -436,7 +440,7 @@ impl Drop for AsyncPool {
 fn gilboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let _ = env_logger::try_init(); 
-    info!("[GILBOOST_MODULE_LOAD {}] Initializing gilboost module.", process::id());
+    debug!("[GILBOOST_MODULE_LOAD {}] Initializing gilboost module.", process::id());
     m.add("dummy_attr", "test")?; // Add a dummy attribute
     m.add_class::<AsyncPool>()?;
     m.add_function(wrap_pyfunction!(child, m)?)?;
