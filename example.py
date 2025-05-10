@@ -9,30 +9,25 @@ def _sum_pow(base: int, power: int) -> int:
     )
 
 async def sum_pow(base: int, power: int) -> int:
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.0001)
     return _sum_pow(base, power)
 
-sum_pow = AsyncPool.wraps(sum_pow, replicas=8)
+sum_pow_process = AsyncPool.wraps(sum_pow, replicas=8)
     
-async def vanilla_sum_pow(base: int, power: int) -> int:
-    await asyncio.sleep(0.1)
-    return _sum_pow(base, power)
-
 # benchmark 2*vanilla_sum_pow vs (vanilla_sum_pow + sum_pow)
-async def benchmark(n=8, exp=28):
+async def benchmark(n=128, exp=16):
 
     start = time.time()
 
     await asyncio.gather(
-        *[vanilla_sum_pow(2, exp) for _ in range(n)],
+        *[sum_pow(2, exp) for _ in range(n)],
     )
     end = time.time()
     
     print(f"Vanilla benchmark finished in {end - start:.2f} seconds")
     start = time.time()
     await asyncio.gather(
-        *[sum_pow(2, exp) for _ in range(n-1)],
-        vanilla_sum_pow(2, exp)
+        *[sum_pow_process(2, exp) for _ in range(n)],
     )
     end = time.time()
     print(f"Process benchmark finished in {end - start:.2f} seconds")
