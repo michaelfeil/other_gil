@@ -177,7 +177,7 @@ fn child_loop(
     process::exit(0); // Ensure child process exits after loop
 }
 
-fn child_process_entry_point(
+async fn child_process_entry_point(
     p2c_rendezvous_server_name: String,
     c2p_data_server_name: String
 ) -> PyResult<()> {
@@ -208,17 +208,22 @@ fn child_process_entry_point(
 
     info!("[CHILD_SPAWN_ENTRY PID {}] IPC fully established. Calling child_loop.", std::process::id());
 
-    child_loop(rx_from_parent, tx_to_parent);
+    tokio::task::spawn_blocking(move || {
+        child_loop(rx_from_parent, tx_to_parent);
+    }).await.map_err(|e| PyValueError::new_err(format!("Child: Failed to spawn blocking task: {}", e)))?;
 
     Ok(())
 }
 
 #[pyfunction]
-pub fn child(p2c_rendezvous_server_name: String, c2p_data_server_name: String) -> PyResult<()> {
+pub fn _child(py: Python, p2c_rendezvous_server_name: String, c2p_data_server_name: String) -> PyResult<Bound<PyAny>> {
     info!("[GILBOOST_CHILD] P2C Rendezvous Server: {}", p2c_rendezvous_server_name);
     info!("[GILBOOST_CHILD] C2P Data Server: {}", c2p_data_server_name);
 
-    child_process_entry_point(p2c_rendezvous_server_name, c2p_data_server_name)
+    pyo3_async_runtimes::tokio::future_into_py(py, async {
+        let _ = child_process_entry_point(p2c_rendezvous_server_name, c2p_data_server_name).await;
+        Ok(())
+    })
 }
 
 #[pyclass()]
@@ -280,10 +285,12 @@ impl AsyncPool {
             let mut cmd = Command::new(&resolved_python_executable);
             cmd.arg("-c")
                 .arg(format!(r#"
-import os, sys, traceback
+import os, sys, traceback, asyncio
 try:
     import gilboost 
-    gilboost.child("{}", "{}")
+    async def forever():
+        await gilboost._child("{}", "{}")
+    asyncio.run(forever())
 except Exception as e:
     traceback.print_exc(file=sys.stderr)
     sys.exit(1)
@@ -441,9 +448,7 @@ fn gilboost(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     let _ = env_logger::try_init(); 
     debug!("[GILBOOST_MODULE_LOAD {}] Initializing gilboost module.", process::id());
-    m.add("dummy_attr", "test")?; // Add a dummy attribute
     m.add_class::<AsyncPool>()?;
-    m.add_function(wrap_pyfunction!(child, m)?)?;
-    
+    m.add_function(wrap_pyfunction!(_child, m)?)?;
     Ok(())
 }
