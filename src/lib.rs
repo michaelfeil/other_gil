@@ -53,13 +53,47 @@ fn create_ipc_setup_endpoints() -> PyResult<IpcSetupEndpoints> {
     })
 }
 
-async fn child_loop(
-    rx_from_parent: ipc::IpcReceiver<Vec<u8>>,
-    tx_to_parent: ipc::IpcSender<Vec<u8>>,
+// Helper to attempt to send a pickled Python error back to the parent.
+fn try_send_pickled_py_error_to_parent(
+    tx_to_parent: &ipc::IpcSender<Vec<u8>>,
+    dumps: &Bound<'_, PyAny>, // cloudpickle.dumps
+    error_to_pickle: PyObject, // The Python error object to pickle
+    child_pid: u32,
+    context_msg: &str, // Short description of when the error occurred
 ) {
-    let child_pid = process::id();
-    info!("[CHILD PID {}] Starting child loop", child_pid);
+    match dumps.call1((error_to_pickle,)) {
+        Ok(pickled_error_bytes_obj) => match pickled_error_bytes_obj.extract::<Vec<u8>>() {
+            Ok(pickled_error_bytes) => {
+                if let Err(e) = tx_to_parent.send(pickled_error_bytes) {
+                    error!(
+                        "[CHILD PID {}] While {}: Failed to send pickled Python error to parent: {:?}",
+                        child_pid, context_msg, e
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    "[CHILD PID {}] While {}: Failed to extract bytes from pickled Python error: {:?}",
+                    child_pid, context_msg, e
+                );
+            }
+        },
+        Err(e) => {
+            error!(
+                "[CHILD PID {}] While {}: Failed to pickle Python error for parent: {:?}",
+                child_pid, context_msg, e
+            );
+        }
+    }
+}
 
+// Helper to receive and deserialize FunctionInfo.
+// Returns Err(()) if the child should exit due to an error in this phase.
+fn receive_and_deserialize_function_info(
+    rx_from_parent: &ipc::IpcReceiver<Vec<u8>>,
+    tx_to_parent: &ipc::IpcSender<Vec<u8>>,
+    child_pid: u32,
+) -> FunctionInfo {
     let function_info: FunctionInfo = match rx_from_parent.recv() {
         Ok(bytes) => match bincode::deserialize(&bytes) {
             Ok(fi) => fi,
@@ -88,143 +122,152 @@ async fn child_loop(
             process::exit(1);
         }
     };
+    function_info
+}
+
+// Helper function for the Python-specific processing loop.
+// Returns PyResult to indicate success or a critical Python-related error.
+fn python_processing_loop(
+    py: Python,
+    rx_from_parent: &ipc::IpcReceiver<Vec<u8>>,
+    tx_to_parent: &ipc::IpcSender<Vec<u8>>,
+    function_info: FunctionInfo,
+    child_pid: u32,
+) -> PyResult<()> {
     info!(
-        "[CHILD PID {}] Received and deserialized FunctionInfo for: {}",
+        "[CHILD PID {}] Python GIL acquired. Unpickling function '{}' with cloudpickle.",
         child_pid, function_info.function_name
     );
 
-    Python::with_gil(|py| {
-        info!(
-            "[CHILD PID {}] Unpickling function '{}' with cloudpickle",
-            child_pid, function_info.function_name
-        );
-        let cloudpickle = match py.import("cloudpickle") {
-            Ok(m) => m,
+    let cloudpickle = py.import("cloudpickle").unwrap();
+    let asyncio = py.import("asyncio").unwrap();
+    let event_loop = asyncio.call_method0("new_event_loop").unwrap();
+    let inspect = py.import("inspect").unwrap();
+    let dumps = cloudpickle.getattr("dumps").unwrap();
+    let loads = cloudpickle.getattr("loads").unwrap();
+
+    let func_obj = loads.call1((PyBytes::new(py, &function_info.pickled_func),))?;
+    let func = func_obj.downcast_into::<PyFunction>()?; // No need for .to_owned() if just using it
+
+    let is_coroutine = inspect
+        .getattr("iscoroutinefunction")?
+        .call1((func.as_ref(),))? // func is Bound, use .as_ref()
+        .extract::<bool>()?;
+
+    info!(
+        "[CHILD PID {}] Function '{}' unpickled successfully. is_coroutine: {}. Entering request loop.",
+        child_pid, function_info.function_name, is_coroutine
+    );
+
+    loop {
+        debug!("[CHILD PID {}] Waiting for pickled arguments from parent...", child_pid);
+        let pickled_args = match rx_from_parent.recv() {
+            Ok(bytes) => bytes,
             Err(e) => {
-                error!(
-                    "[CHILD PID {}] Error importing cloudpickle: {:?}",
-                    child_pid, e
-                );
-                return;
+                error!("[CHILD PID {}] Error receiving arguments from parent: {:?}. Terminating python loop.", child_pid, e);
+                return Err(PyValueError::new_err(format!("IPC receive error: {}", e)));
             }
         };
-        let asyncio = py.import("asyncio").unwrap();
-        let event_loop = asyncio.call_method0("new_event_loop").unwrap();
-        let inspect = py.import("inspect").unwrap();
-        let dumps = cloudpickle.getattr("dumps").unwrap();
-        let loads = cloudpickle.getattr("loads").unwrap();
 
-        let func = match || -> PyResult<Bound<'_, PyFunction>> {
-            let unpickled = loads.call1((PyBytes::new(py, &function_info.pickled_func),))?;
-            let func = unpickled.downcast::<PyFunction>()?;
-            Ok(func.clone())
-        }() {
-            Ok(f) => f,
+        let args_tuple = match loads.call1((PyBytes::new(py, &pickled_args),)) {
+            Ok(obj) => match obj.downcast_into::<PyTuple>() {
+                Ok(tuple) => tuple,
+                Err(e) => {
+                    error!("[CHILD PID {}] Failed to downcast unpickled args to PyTuple: {:?}. Skipping request.", child_pid, e);
+                    try_send_pickled_py_error_to_parent( tx_to_parent, &dumps, PyErr::from(e).into_py(py), child_pid, "downcasting args");
+                    continue;
+                }
+            },
             Err(e) => {
-                error!(
-                    "[CHILD PID {}] Failed to unpickle function: {:?}",
-                    child_pid, e
-                );
-                return;
+                error!("[CHILD PID {}] Error unpickling arguments: {:?}. Skipping request.", child_pid, e);
+                try_send_pickled_py_error_to_parent( tx_to_parent, &dumps, e.into_py(py), child_pid, "unpickling args");
+                continue;
             }
         };
-        let is_coroutine = inspect
-            .getattr("iscoroutinefunction")
-            .unwrap()
-            .call1((func.clone(),))
-            .unwrap()
-            .extract::<bool>()
-            .unwrap();
-        info!(
-            "[CHILD PID {}] Function unpickled successfully: {}",
-            child_pid, function_info.function_name
-        );
 
-        loop {
-            debug!(
-                "[CHILD PID {}] Waiting for pickled arguments from parent...",
-                child_pid
-            );
-            let pickled_args = match rx_from_parent.recv() {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    error!(
-                        "[CHILD PID {}] Error receiving arguments: {:?}, exiting",
-                        child_pid, e
-                    );
-                    break;
-                }
-            };
-            let args_obj = match loads.call1((PyBytes::new(py, &pickled_args),)) {
-                Ok(o) => o,
-                Err(e) => {
-                    error!("[CHILD PID {}] Error unpickling args: {:?}", child_pid, e);
-                    continue;
-                }
-            };
-            let args_tuple = match args_obj.downcast::<PyTuple>() {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(
-                        "[CHILD PID {}] Expected tuple of arguments, got error: {:?}",
-                        child_pid, e
-                    );
-                    continue;
-                }
-            };
-            trace!(
-                "[CHILD PID {}] Calling function with unpickled arguments",
-                child_pid
-            );
-            let call_result_obj = match func.call(args_tuple, None) {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("[CHILD PID {}] Error calling function: {:?}", child_pid, e);
-                    continue;
-                }
-            };
-
-            let final_ret_obj = if is_coroutine {
-                debug!(
-                    "[CHILD PID {}] Function is a coroutine, awaiting result",
-                    child_pid
-                );
-                let await_result = event_loop
-                    .call_method1("run_until_complete", (call_result_obj,))
-                    .unwrap();
-                await_result
-            } else {
-                call_result_obj
-            };
-            let pickled_ret: Vec<u8> = match dumps.call1((final_ret_obj,)) {
-                Ok(py_bytes) => match py_bytes.extract() {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(
-                            "[CHILD PID {}] Error extracting pickled return: {:?}",
-                            child_pid, e
-                        );
-                        continue;
-                    }
-                },
-                Err(e) => {
-                    error!(
-                        "[CHILD PID {}] Error pickling return value: {:?}",
-                        child_pid, e
-                    );
-                    continue;
-                }
-            };
-            if let Err(e) = tx_to_parent.send(pickled_ret) {
-                error!(
-                    "[CHILD PID {}] Failed to send return value: {:?}",
-                    child_pid, e
-                );
+        trace!("[CHILD PID {}] Calling function '{}' with unpickled arguments", child_pid, function_info.function_name);
+        let call_result_obj = match func.call(args_tuple.as_borrowed(), None) {
+            Ok(r) => r,
+            Err(e) => {
+                error!("[CHILD PID {}] Error calling user function '{}': {:?}. Sending error to parent.", child_pid, function_info.function_name, e);
+                try_send_pickled_py_error_to_parent(tx_to_parent, &dumps, e.into_py(py), child_pid, "calling user function");
+                continue;
             }
+        };
+
+        let final_ret_obj = if is_coroutine {
+            debug!("[CHILD PID {}] Function '{}' is a coroutine, awaiting result.", child_pid, function_info.function_name);
+            match event_loop.call_method1("run_until_complete", (call_result_obj,)) {
+                Ok(awaited_result) => awaited_result,
+                Err(e) => {
+                    error!("[CHILD PID {}] Error awaiting coroutine for function '{}': {:?}. Sending error to parent.", child_pid, function_info.function_name, e);
+                    try_send_pickled_py_error_to_parent(tx_to_parent, &dumps, e.into_py(py), child_pid, "awaiting coroutine");
+                    continue;
+                }
+            }
+        } else {
+            call_result_obj
+        };
+
+        let pickled_ret_bytes = match dumps.call1((final_ret_obj.as_ref(),)) { // final_ret_obj is Bound
+            Ok(py_bytes_obj) => match py_bytes_obj.extract::<Vec<u8>>() {
+                Ok(b) => b,
+                Err(e) => {
+                    error!("[CHILD PID {}] Error extracting bytes from pickled return value for function '{}': {:?}. Sending error to parent.", child_pid, function_info.function_name, e);
+                    try_send_pickled_py_error_to_parent(tx_to_parent, &dumps, e.into_py(py), child_pid, "extracting pickled return");
+                    continue;
+                }
+            },
+            Err(e) => {
+                error!("[CHILD PID {}] Error pickling return value for function '{}': {:?}. Sending error to parent.", child_pid, function_info.function_name, e);
+                try_send_pickled_py_error_to_parent(tx_to_parent, &dumps, e.into_py(py), child_pid, "pickling return value");
+                continue;
+            }
+        };
+
+        if let Err(e) = tx_to_parent.send(pickled_ret_bytes) {
+            error!("[CHILD PID {}] Failed to send result to parent: {:?}. Terminating python loop.", child_pid, e);
+            return Err(PyValueError::new_err(format!("IPC send error: {}", e)));
         }
-        info!("[CHILD PID {}] Exiting child loop", child_pid);
+        trace!("[CHILD PID {}] Successfully sent result for function '{}' to parent.", child_pid, function_info.function_name);
+    }
+    // This part is unreachable if the loop correctly handles IPC errors by returning Err.
+    // If the loop could terminate "normally" (e.g., via a special command), Ok(()) would be returned here.
+}
+
+async fn child_loop(
+    rx_from_parent: ipc::IpcReceiver<Vec<u8>>,
+    tx_to_parent: ipc::IpcSender<Vec<u8>>,
+) {
+    let child_pid = process::id();
+    info!("[CHILD PID {}] Starting child loop", child_pid);
+
+    let function_info = receive_and_deserialize_function_info(&rx_from_parent, &tx_to_parent, child_pid);
+
+    let python_loop_result = Python::with_gil(|py| {
+        python_processing_loop(py, &rx_from_parent, &tx_to_parent, function_info, child_pid)
     });
-    process::exit(0); // Ensure child process exits after loop
+
+    match python_loop_result {
+        Ok(()) => {
+            // This would mean python_processing_loop exited its main loop "gracefully"
+            // without an IPC error or initial setup error.
+            // Given the infinite loop design, this path is unlikely unless a break condition is added.
+            info!("[CHILD PID {}] Python processing loop completed. Exiting.", child_pid);
+        }
+        Err(e) => {
+            // This PyErr originated from a critical failure in python_processing_loop
+            // (e.g., cloudpickle import, IPC error detected within).
+            error!(
+                "[CHILD PID {}] Python processing loop terminated with error: {:?}. Exiting.",
+                child_pid, e
+            );
+            // The parent will likely detect this by the IPC channel closing or timing out.
+        }
+    }
+
+    info!("[CHILD PID {}] Exiting child loop and process.", child_pid);
+    process::exit(0); // Ensure child process exits.
 }
 
 async fn child_process_entry_point(
